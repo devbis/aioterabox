@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aioterabox"
+version = "0.1.0"
+description = "Asyncio client for TeraBox cloud storage"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+
+authors = [
+  { name = "Ivan Belokobylskiy", email = "belokobylskij@gmail.com"}
+]
+
+keywords = ["terabox", "asyncio", "cloud", "client"]
+
+dependencies = [
+  "aiofiles >= 22.1.0",
+  "aiohttp >= 3.9",
+  "cryptography >= 3.4",
+]
+
+[project.urls]
+Homepage = "https://github.com/devbis/aioterabox"
+Repository = "https://github.com/devbis/aioterabox"
+Issues = "https://github.com/devbis/aioterabox/issues"
+
+[tool.setuptools]
+packages = { find = { include = ["aioterabox*"] } }
+
+[tool.ruff]
+line-length = 120
+lint.select = ["E", "F", "I", "B"]
