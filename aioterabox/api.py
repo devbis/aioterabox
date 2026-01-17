@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import io
 import json
 import os
 from io import IOBase
@@ -29,6 +30,42 @@ class FileInfo(NamedTuple):
     path: str
     size: int
     is_dir: bool = False
+
+
+class NonClosableIO(io.IOBase):
+    def __init__(self, wrapped: io.IOBase):
+        self._wrapped = wrapped
+
+    def read(self, size=-1):
+        return self._wrapped.read(size)
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return self._wrapped.seekable()
+
+    def seek(self, offset, whence=0):
+        return self._wrapped.seek(offset, whence)
+
+    def tell(self):
+        return self._wrapped.tell()
+
+    def fileno(self):
+        return self._wrapped.fileno()
+
+    @property
+    def closed(self):
+        return self._wrapped.closed
+
+    def close(self):
+        pass
+
+    def force_close(self):
+        self._wrapped.close()
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
 
 
 class TeraBoxClient:
@@ -137,29 +174,35 @@ class TeraBoxClient:
                     for entry in response
                 ]
 
-    async def _upload_file_chunk(self, file: IOBase, remote_path: str, chunk_md5: str, uploadid: str,
-                                 partseq: int = 0) -> dict:
+    async def _upload_file_chunk(self, upload_host: str, file: IOBase, remote_path: str, chunk_md5: str, uploadid: str,
+                                 partseq: int = 0, max_attempts: int = 6) -> dict:
         """Upload a file chunk to TeraBox."""
         async with self.get_session(headers={
             "Referer": BASE_TERABOX_URL + "/main?category=all",
         }) as session:
-            data = aiohttp.FormData()
-            data.add_field(
-                'file',
-                file,
-                filename=os.path.basename(remote_path),
-                content_type="application/octet-stream",
-            )
-            for i in range(2, -1, -1):
+            for i in range(max_attempts - 1, -1, -1):
+                file.seek(0)
                 try:
+                    data = aiohttp.FormData()
+                    data.add_field(
+                        'file',
+                        NonClosableIO(file),
+                        filename=os.path.basename(remote_path),
+                        content_type="application/octet-stream",
+                    )
                     async with session.post(
-                        f"{BASE_TERABOX_URL.replace('www', 'c-jp')}:443/rest/2.0/pcs/superfile2?"
+                        f"https://{upload_host}/rest/2.0/pcs/superfile2?"
                         f"method=upload&type=tmpfile&app_id=250528&path={quote_plus(remote_path)}&"
                         f"uploadid={uploadid}&partseq={partseq}",
                         data=data,
-                        timeout=5,
+                        timeout=15,
                     ) as response:
-                        resp =await response.json()
+                        content = await response.read()
+                        try:
+                            resp = json.loads(content)
+                        except json.JSONDecodeError:
+                            raise TeraboxApiError(f"File upload failed: {content.decode(errors='ignore')}")
+
                         if 'error_code' in resp:
                             if resp['error_code'] == 31208:
                                 raise TeraboxContentTypeError(resp['error_msg'])
@@ -167,9 +210,12 @@ class TeraBoxClient:
 
                         if resp['md5'] != chunk_md5:
                             raise TeraboxChecksumMismatchError("MD5 hash mismatch after file upload.")
+                        break
                 except (aiohttp.ClientError, asyncio.TimeoutError):
+                    print('... problem, retrying upload ...')
                     if i > 0:
                         continue
+                    raise
             return resp
 
     async def _precreate_file(self, remote_path: str, md5_list_json: list[str]) -> str:
@@ -230,6 +276,20 @@ class TeraBoxClient:
                     return resp_data
                 raise TeraboxApiError(f"File create failed: {resp_data}")
 
+    async def _locate_upload_host(self) -> str:
+        """Locate the upload server."""
+        async with self.get_session(headers={
+            "Referer": BASE_TERABOX_URL + "/main?category=all",
+        }) as session:
+            async with session.get(
+                "https://d.terabox.com/rest/2.0/pcs/file?method=locateupload",
+            ) as response:
+                resp_data = await response.json(content_type=None)
+                host = resp_data.get("host")
+                if not host:
+                    raise TeraboxApiError(f"Locate upload server failed: {resp_data}")
+                return host
+
     async def upload_file(self, file: IOBase, destination_path: str) -> dict:
         """Upload a file to TeraBox.
 
@@ -276,6 +336,7 @@ class TeraBoxClient:
                 file.seek(0)
                 chunks = [file]
 
+            upload_host = await self._locate_upload_host()
             uploadid = await self._precreate_file(destination_path, file_chunks_md5)
             chunk_results = []
             for partseq, (chunk, chunk_md5) in enumerate(zip(chunks, file_chunks_md5, strict=True)):
@@ -285,6 +346,7 @@ class TeraBoxClient:
                     is_filename = True
                 try:
                     resp = await self._upload_file_chunk(
+                        upload_host=upload_host,
                         file=chunk,
                         remote_path=destination_path,
                         chunk_md5=chunk_md5,
@@ -304,3 +366,88 @@ class TeraBoxClient:
             )
 
         return final_resp
+
+    async def _filemanager(self, operation: str, remote_paths: list[str | dict]) -> dict:
+        """
+        For Delete: ["/path1","path2.rar"]
+        For Move: [{"path":"/myfolder/source.bin","dest":"/target/","newname":"newfilename.bin"}]
+        For Copy same as move
+        + "ondup": newcopy, overwrite (optional, skip by default)
+        For rename [{"id":1111,"path":"/dir1/src.bin","newname":"myfile2.bin"}]
+
+        operation - copy (file copy), move (file movement), rename (file renaming), and delete (file deletion)
+        opera=copy: filelist: [{"path":"/hello/test.mp4","dest":"","newname":"test.mp4"}]
+        opera=move: filelist: [{"path":"/test.mp4","dest":"/test_dir","newname":"test.mp4"}]
+        opera=rename: filelist：[{"path":"/hello/test.mp4","newname":"test_one.mp4"}]
+        opera=delete: filelist: ["/test.mp4"]
+
+        """
+
+        async with self.get_session(headers={
+            "Referer": BASE_TERABOX_URL + "/main?category=all",
+        }) as session:
+            data = {
+                "app_id": "250528",
+                "web": "1",
+                "channel": "dubox",
+                "clienttype": "0",
+                "jsToken": self.jstoken,
+                "filelist": json.dumps(remote_paths),
+            }
+
+            async with session.post(
+                f"{BASE_TERABOX_URL}/api/filemanager?opera={operation}&jsToken={self.jstoken}",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data=data,
+                timeout=10,
+            ) as response:
+                resp_data = await response.json()
+                if resp_data.get("errno") == 0:
+                    return resp_data
+                raise TeraboxApiError(f"File delete failed: {resp_data}")
+
+    async def delete_files(self, remote_paths: list[str]) -> dict:
+        """Delete a file from TeraBox.
+
+        @param remote_path: path to the file to delete
+        """
+
+        return await self._filemanager('delete', remote_paths)
+
+    async def copy_file(self, remote_src_path: str, remote_dst_path: str) -> dict:
+        """Copy a file in TeraBox.
+
+        @param remote_src_path: path to the source file
+        @param remote_dst_path: path to the destination file
+        """
+
+        return await self._filemanager('copy', [{
+            "path": remote_src_path,
+            "dest": os.path.dirname(remote_dst_path),
+            "newname": os.path.basename(remote_dst_path),
+        }])
+
+    async def move_file(self, remote_src_path: str, remote_dst_path: str) -> dict:
+        """Copy a file in TeraBox.
+
+        @param remote_src_path: path to the source file
+        @param remote_dst_path: path to the destination file
+        """
+
+        return await self._filemanager('copy', [{
+            "path": remote_src_path,
+            "dest": os.path.dirname(remote_dst_path),
+            "newname": os.path.basename(remote_dst_path),
+        }])
+
+    async def rename_file(self, remote_src_path: str, new_name: str) -> dict:
+        """Rename a file in TeraBox.
+
+        @param remote_src_path: path to the source file
+        @param new_name: new name for the file
+        """
+
+        return await self._filemanager('rename', [{
+            "path": remote_src_path,
+            "newname": new_name,
+        }])
