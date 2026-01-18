@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from io import IOBase
 from tempfile import TemporaryDirectory
 from typing import NamedTuple
@@ -10,7 +11,8 @@ from urllib.parse import quote_plus
 
 import aiohttp
 
-from aioterabox.exceptions import (
+from .encryption import change_base64_type, decrypt_aes, encrypt_rsa
+from .exceptions import (
     TeraboxApiError,
     TeraboxChecksumMismatchError,
     TeraboxContentTypeError,
@@ -68,27 +70,41 @@ class NonClosableIO(io.IOBase):
         return getattr(self._wrapped, name)
 
 
+def prand_gen(client: str, seval: str, encpwd: str, email: str, browserid: str, random: str) -> str:
+    combined = f"{client}-{seval}-{encpwd}-{email}-{browserid}-{random}"
+    sha1 = hashlib.sha1()
+    sha1.update(combined.encode('utf-8'))
+    return sha1.hexdigest()
+
+
 class TeraBoxClient:
-    def __init__(self, jstoken: str, csrf_token: str, browserid: str, ndus: str, ndut_fmt: str,
+    def __init__(self, jstoken: str, csrf_token: str, browserid: str, ndus: str, # ndut_fmt: str,
                  lang: str = 'en') -> None:
         self.jstoken = jstoken
         self.csrf_token = csrf_token
         self.browserid = browserid
         self.ndus = ndus
-        self.ndut_fmt = ndut_fmt
+        # self.ndut_fmt = ndut_fmt
         self.lang = lang
 
         self.is_vip: bool | None = None
+
+        self._public_key: str | None = None
+        self._session_cookies1: dict[str, str] = {}
+
+        self._session_cookies: dict[str, str] = {
+            'csrfToken': self.csrf_token,
+            'browserid': self.browserid,
+            'lang': self.lang,
+            'ndus': self.ndus,
+        }
 
     @property
     def request_cookies(self) -> dict[str, str]:
         """Get the cookies needed for requests."""
         return {
-            'csrfToken': self.csrf_token,
-            'browserid': self.browserid,
+            **self._session_cookies,
             'lang': self.lang,
-            'ndus': self.ndus,
-            'ndut_fmt': self.ndut_fmt,
         }
 
     @staticmethod
@@ -98,8 +114,10 @@ class TeraBoxClient:
             h.update(chunk)
         return h.hexdigest()
 
-    def get_session(self, headers: dict[str, str]) -> aiohttp.ClientSession:
+    def get_session(self, headers: dict[str, str] | None = None) -> aiohttp.ClientSession:
         """Get an aiohttp session with the necessary cookies and headers."""
+        if headers is None:
+            headers = {}
         return aiohttp.ClientSession(
             headers={
                 "User-Agent": USER_AGENT,
@@ -136,7 +154,7 @@ class TeraBoxClient:
 
     async def list_remote_directory(self, remote_dir: str) -> list[FileInfo]:
         """List the contents of a remote directory."""
-        async with self.get_session(headers={"Referer": BASE_TERABOX_URL + "/main"}) as session:
+        async with self.get_session() as session:
             async with session.get(
                 f"{BASE_TERABOX_URL}/api/list",
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
@@ -201,7 +219,7 @@ class TeraBoxClient:
                         try:
                             resp = json.loads(content)
                         except json.JSONDecodeError:
-                            raise TeraboxApiError(f"File upload failed: {content.decode(errors='ignore')}")
+                            raise TeraboxApiError(f"File upload failed: {content.decode(errors='ignore')}") from None
 
                         if 'error_code' in resp:
                             if resp['error_code'] == 31208:
@@ -212,7 +230,7 @@ class TeraBoxClient:
                             raise TeraboxChecksumMismatchError("MD5 hash mismatch after file upload.")
                         break
                 except (aiohttp.ClientError, asyncio.TimeoutError):
-                    print('... problem, retrying upload ...')
+                    # print('... problem, retrying upload ...')
                     if i > 0:
                         continue
                     raise
@@ -451,3 +469,138 @@ class TeraBoxClient:
             "path": remote_src_path,
             "newname": new_name,
         }])
+
+    async def get_public_key(self) -> str:
+        if self._public_key is None:
+            async with aiohttp.ClientSession(
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Origin": BASE_TERABOX_URL,
+                    "Referer": BASE_TERABOX_URL + "/main",
+                },
+            ) as session:
+                async with session.get(
+                    f"{BASE_TERABOX_URL}/passport/getpubkey",
+                    timeout=10,
+                ) as response:
+                    data = await response.json()
+                    self._public_key = decrypt_aes(data['data']['pp1'], data['data']['pp2'])
+        return self._public_key
+
+    async def fetch_initial_data(self) -> dict:
+        async with aiohttp.ClientSession(
+            headers={
+                "User-Agent": USER_AGENT,
+                "Origin": BASE_TERABOX_URL,
+                "Referer": BASE_TERABOX_URL + "/main",
+            },
+        ) as session:
+            async with session.get(
+                f"{BASE_TERABOX_URL}/main",
+                timeout=10,
+            ) as response:
+                text = await response.text()
+                tdata_rx = re.compile(r'<script>var templateData = (.*);</script>')
+                js_token_rx = re.compile(r'window.jsToken%20%3D%20a%7D%3Bfn%28%22(.*)%22%29')
+
+                # {'bdstoken': '', 'pcftoken': '98**20',
+                # 'newDomain': {'origin': 'https://www.terabox.com', 'host': 'www.terabox.com',
+                # 'domain': 'terabox.com', 'cdn': 'https://s3.teraboxcdn.com',
+                # 'isGCP': False, 'originalPrefix': 'www', 'regionDomainPrefix': 'www', 'urlDomainPrefix': 'www'},
+                # 'internal': False, 'country': '', 'userVipIdentity': 0, 'uk': 0}
+                tdata = json.loads(tdata_rx.search(text).group(1))
+                js_token = js_token_rx.search(text).group(1)
+
+                return {
+                    'bdstoken': tdata.get('bdstoken', ''),
+                    'pcftoken': tdata.get('pcftoken', ''),
+                    'js_token': js_token,
+                    'cookies': {cookie.key: cookie.value for cookie in session.cookie_jar},
+                }
+
+    async def prelogin(self, email: str) -> tuple[dict, dict]:
+        initial_vars = await self.fetch_initial_data()
+
+        async with aiohttp.ClientSession(
+            headers={
+                "User-Agent": USER_AGENT,
+                "Origin": BASE_TERABOX_URL,
+                "Referer": BASE_TERABOX_URL + "/main",
+            },
+            cookies=initial_vars['cookies'],
+        ) as session:
+            async with session.post(
+                f"{BASE_TERABOX_URL}/passport/prelogin",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    'client': 'web',
+                    'pass_version': '2.8',
+                    'clientfrom': 'h5',
+                    'pcftoken': initial_vars['pcftoken'],
+                    'email': email,
+                },
+                timeout=10,
+            ) as response:
+                data = await response.json()
+                return initial_vars, data['data']
+
+
+    async def login(self, email: str, password: str) -> dict:
+        initial_vars, prelogin = await self.prelogin(email)
+
+        async with aiohttp.ClientSession(
+            headers={
+                "User-Agent": USER_AGENT,
+                "Origin": BASE_TERABOX_URL,
+                "Referer": BASE_TERABOX_URL + "/main",
+            },
+            cookies=initial_vars['cookies'],
+        ) as session:
+            encpass = change_base64_type(encrypt_rsa(password, await self.get_public_key(), 2), 2)
+            # print('cookies before', {cookie.key: cookie.value for cookie in session.cookie_jar})
+            prand = prand_gen(
+                client='web',
+                seval=prelogin['seval'],
+                encpwd=encpass,
+                email=email,
+                browserid=initial_vars['cookies']['browserid'],
+                random=prelogin['random'],
+            )
+
+            async with session.post(
+                f"{BASE_TERABOX_URL}/passport/login",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    'client': 'web',
+                    'pass_version': '2.8',
+                    'clientfrom': 'h5',
+                    'pcftoken': initial_vars['pcftoken'],
+                    'prand': prand,
+                    'email': email,
+                    'pwd': encpass,
+                    'seval': prelogin['seval'],
+                    'random': prelogin['random'],
+                    'timestamp': prelogin['timestamp'],
+                },
+                timeout=10,
+            ) as response:
+                data = await response.json()
+                # print('initial data = ', initial_vars)
+                # print('cookies after', {cookie.key: cookie.value for cookie in session.cookie_jar})
+                # print('login data = ', data)
+                if data['code'] != 0:
+                    raise TeraboxUnauthorizedError(f"Login failed: {data['errmsg']}")
+                self.ndus = session.cookie_jar.filter_cookies(BASE_TERABOX_URL).get('ndus').value
+                self._session_cookies = {cookie.key: cookie.value for cookie in session.cookie_jar}
+
+                self.jstoken = initial_vars['js_token']
+                # we need to update jstoken after login because it changes to a shorter, authorized one
+                async with session.get(
+                    f"{BASE_TERABOX_URL}/main",
+                    timeout=10,
+                ) as logged_response:
+                    resp = await logged_response.text()
+                    js_token_rx = re.compile(r'templateData.*?window.jsToken%20%3D%20a%7D%3Bfn%28%22(.*?)%22%29')
+                    self.jstoken = js_token_rx.search(resp).group(1)
+
+                return data
