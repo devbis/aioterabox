@@ -4,9 +4,10 @@ import io
 import json
 import os
 import re
+from contextlib import asynccontextmanager
 from io import IOBase
 from tempfile import TemporaryDirectory
-from typing import NamedTuple, TypedDict, get_type_hints, Any
+from typing import Any, NamedTuple, TypedDict, get_type_hints
 from urllib.parse import quote_plus
 
 import aiohttp
@@ -28,8 +29,8 @@ READ_BUF = 4 * 1024 * 1024  # 4 MB
 
 
 class TeraboxCookies(TypedDict):
-    js_token: str  # not a cookie but we store it here for convenience
-    csrf_token: str
+    jstoken: str  # not a cookie but we store it here for convenience
+    csrfToken: str
     browserid: str
     ndus: str
 
@@ -85,20 +86,20 @@ def prand_gen(client: str, seval: str, encpwd: str, email: str, browserid: str, 
 
 
 class TeraBoxClient:
-    def __init__(self, email: str, password: str, cookies: dict[str, str] | None = None, lang: str = 'en') -> None:
+    def __init__(self, email: str, password: str, session: aiohttp.ClientSession,
+                 cookies: dict[str, str] | None = None, lang: str = 'en') -> None:
         self.email = email
         self.password = password
         self.lang = lang
 
-        required_cookie_keys = list(get_type_hints(TeraboxCookies).keys())
-        if cookies is not None:
-            missing_keys = [key for key in required_cookie_keys if key not in cookies]
-            if missing_keys:
-                raise ValueError(f"Missing required cookie keys: {', '.join(missing_keys)}")
+        self._cookies: TeraboxCookies = self.validate_cookies(cookies)
 
-        self._cookies: TeraboxCookies = TeraboxCookies(**cookies) if cookies else TeraboxCookies(**{
-            k: '' for k in required_cookie_keys
-        })
+        self.session = session
+        self._base_headers = {
+            "User-Agent": USER_AGENT,
+            "Origin": BASE_TERABOX_URL,
+            "Referer": BASE_TERABOX_URL + "/main",
+        }
 
         self.is_vip: bool | None = None
         self._public_key: str | None = None
@@ -112,9 +113,21 @@ class TeraBoxClient:
             **({'lang': self.lang} if 'lang' not in self._cookies else {}),
         }
 
+    @staticmethod
+    def validate_cookies(cookies: dict[str, Any]):
+        required_cookie_keys = list(get_type_hints(TeraboxCookies).keys())
+        if cookies is not None:
+            missing_keys = [key for key in required_cookie_keys if key not in cookies]
+            if missing_keys:
+                raise ValueError(f"Missing required cookie keys: {', '.join(missing_keys)}")
+
+        return TeraboxCookies(**cookies) if cookies else TeraboxCookies(**{
+            k: '' for k in required_cookie_keys
+        })
+
     @property
     def js_token(self) -> str:
-        return self._cookies['js_token']
+        return self._cookies['jstoken']
 
     @staticmethod
     def file_md5(file: IOBase, chunk_size=1024 * 1024) -> str:
@@ -123,19 +136,38 @@ class TeraBoxClient:
             h.update(chunk)
         return h.hexdigest()
 
-    def get_session(self, headers: dict[str, str] | None = None) -> aiohttp.ClientSession:
-        """Get an aiohttp session with the necessary cookies and headers."""
-        if headers is None:
-            headers = {}
-        return aiohttp.ClientSession(
-            headers={
-                "User-Agent": USER_AGENT,
-                "Origin": BASE_TERABOX_URL,
-                "Referer": BASE_TERABOX_URL + "/main",
-                **headers,
-            },
-            cookies=self.request_cookies,
+    @asynccontextmanager
+    async def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict | None = None,
+        cookies: dict | None = None,
+        clean_cookies: bool = False,
+        **kwargs,
+    ):
+        merged_headers = {
+            **self._base_headers,
+            **(headers or {}),
+        }
+
+        merged_cookies = {
+            **(self._cookies if not clean_cookies else {}),
+            **(cookies or {}),
+        }
+
+        resp = await self.session.request(
+            method,
+            url,
+            headers=merged_headers,
+            cookies=merged_cookies,
+            **kwargs,
         )
+        try:
+            yield resp
+        finally:
+            resp.release()
 
     async def check_vip_status(self) -> bool:
         """Check if the user has VIP status."""
@@ -143,18 +175,15 @@ class TeraBoxClient:
         if self.is_vip is not None:
             return self.is_vip
 
-        async with self.get_session(headers={
-            'Referer': BASE_TERABOX_URL + "/main?category=all",
-        }) as session:
-            async with session.get(
-                f"{BASE_TERABOX_URL}/rest/2.0/membership/proxy/user?method=query",
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=19,
-            ) as response:
-                data = await response.json()
-                vip = data["data"]["member_info"]["is_vip"]
-                self.is_vip = vip == 1
-                return self.is_vip
+        async with self._request(
+            'GET',
+            f"{BASE_TERABOX_URL}/rest/2.0/membership/proxy/user?method=query",
+            timeout=10,
+        ) as response:
+            data = await response.json()
+            vip = data["data"]["member_info"]["is_vip"]
+            self.is_vip = vip == 1
+            return self.is_vip
 
     async def get_max_file_size(self) -> int:
         """Get the maximum file size allowed for upload."""
@@ -163,159 +192,153 @@ class TeraBoxClient:
 
     async def list_remote_directory(self, remote_dir: str) -> list[FileInfo]:
         """List the contents of a remote directory."""
-        async with self.get_session() as session:
-            async with session.get(
-                f"{BASE_TERABOX_URL}/api/list",
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                params={
-                    "app_id": "250528",
-                    "web": "1",
-                    "channel": "dubox",
-                    "clienttype": "5",  # This changed from 0 to 5 in 2025
-                    "jsToken": self.js_token,
-                    "dir": f"/{remote_dir.lstrip('/')}",  # Leading slash is now required
-                    "num": "1000",
-                    "page": "1",
-                    "order": "time",
-                    "desc": "1",
-                    "showempty": "0"
-                },
-                timeout=10,
-            ) as response:
-                data = await response.json()
-                if "errno" in data and data["errno"] != 0:
-                    if data["errno"] == -7:
-                        raise TeraboxNotFoundError('Remote directory not found.')
-                    if data["errno"] == -6:
-                        raise TeraboxUnauthorizedError('Invalid cookies.')
-                    else:
-                        raise TeraboxApiError(f"API error: {data}")
-                response = data.get("list", [])
-                return [
-                    FileInfo(
-                        name=entry["server_filename"],
-                        path=entry["path"],
-                        size=entry["size"],
-                        is_dir=entry["isdir"],
-                    )
-                    for entry in response
-                ]
+        async with self._request(
+            "GET",
+            f"{BASE_TERABOX_URL}/api/list",
+            params={
+                "app_id": "250528",
+                "web": "1",
+                "channel": "dubox",
+                "clienttype": "5",  # This changed from 0 to 5 in 2025
+                "jsToken": self.js_token,
+                "dir": f"/{remote_dir.lstrip('/')}",  # Leading slash is now required
+                "num": "1000",
+                "page": "1",
+                "order": "time",
+                "desc": "1",
+                "showempty": "0"
+            },
+            timeout=10,
+        ) as response:
+            data = await response.json()
+            if "errno" in data and data["errno"] != 0:
+                if data["errno"] == -7:
+                    raise TeraboxNotFoundError('Remote directory not found.')
+                if data["errno"] == -6:
+                    raise TeraboxUnauthorizedError('Invalid cookies.')
+                else:
+                    raise TeraboxApiError(f"API error: {data}")
+            response = data.get("list", [])
+            return [
+                FileInfo(
+                    name=entry["server_filename"],
+                    path=entry["path"],
+                    size=entry["size"],
+                    is_dir=entry["isdir"],
+                )
+                for entry in response
+            ]
 
     async def _upload_file_chunk(self, upload_host: str, file: IOBase, remote_path: str, chunk_md5: str, uploadid: str,
                                  partseq: int = 0, max_attempts: int = 6) -> dict:
         """Upload a file chunk to TeraBox."""
-        async with self.get_session(headers={
-            "Referer": BASE_TERABOX_URL + "/main?category=all",
-        }) as session:
-            for i in range(max_attempts - 1, -1, -1):
-                file.seek(0)
-                try:
-                    data = aiohttp.FormData()
-                    data.add_field(
-                        'file',
-                        NonClosableIO(file),
-                        filename=os.path.basename(remote_path),
-                        content_type="application/octet-stream",
-                    )
-                    async with session.post(
-                        f"https://{upload_host}/rest/2.0/pcs/superfile2?"
-                        f"method=upload&type=tmpfile&app_id=250528&path={quote_plus(remote_path)}&"
-                        f"uploadid={uploadid}&partseq={partseq}",
-                        data=data,
-                        timeout=15,
-                    ) as response:
-                        content = await response.read()
-                        try:
-                            resp = json.loads(content)
-                        except json.JSONDecodeError:
-                            raise TeraboxApiError(f"File upload failed: {content.decode(errors='ignore')}") from None
+        for i in range(max_attempts - 1, -1, -1):
+            file.seek(0)
+            try:
+                data = aiohttp.FormData()
+                data.add_field(
+                    'file',
+                    NonClosableIO(file),
+                    filename=os.path.basename(remote_path),
+                    content_type="application/octet-stream",
+                )
+                async with self._request(
+                    'POST',
+                    f"https://{upload_host}/rest/2.0/pcs/superfile2?"
+                    f"method=upload&type=tmpfile&app_id=250528&path={quote_plus(remote_path)}&"
+                    f"uploadid={uploadid}&partseq={partseq}",
+                    data=data,
+                    timeout=15,
+                ) as response:
+                    content = await response.read()
+                    try:
+                        resp = json.loads(content)
+                    except json.JSONDecodeError:
+                        raise TeraboxApiError(f"File upload failed: {content.decode(errors='ignore')}") from None
 
-                        if 'error_code' in resp:
-                            if resp['error_code'] == 31208:
-                                raise TeraboxContentTypeError(resp['error_msg'])
-                            raise TeraboxApiError(f"File upload failed: {resp}")
+                    if 'error_code' in resp:
+                        if resp['error_code'] == 31208:
+                            raise TeraboxContentTypeError(resp['error_msg'])
+                        raise TeraboxApiError(f"File upload failed: {resp}")
 
-                        if resp['md5'] != chunk_md5:
-                            raise TeraboxChecksumMismatchError("MD5 hash mismatch after file upload.")
-                        break
-                except (aiohttp.ClientError, asyncio.TimeoutError):
-                    # print('... problem, retrying upload ...')
-                    if i > 0:
-                        continue
-                    raise
-            return resp
+                    if resp['md5'] != chunk_md5:
+                        raise TeraboxChecksumMismatchError("MD5 hash mismatch after file upload.")
+                    break
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                # print('... problem, retrying upload ...')
+                if i > 0:
+                    continue
+                raise
+        return resp
 
     async def _precreate_file(self, remote_path: str, md5_list_json: list[str]) -> str:
-        async with self.get_session(headers={
-            "Referer": BASE_TERABOX_URL + "/main?category=all",
-        }) as session:
-            data = {
-                "app_id": "250528",
-                "web": "1",
-                "channel": "dubox",
-                "clienttype": "0",
-                "jsToken": self.js_token,
-                "path": remote_path,
-                "autoinit": "1",
-                "target_path": os.path.dirname(remote_path),
-                "block_list": json.dumps(md5_list_json),
-            }
+        data = {
+            "app_id": "250528",
+            "web": "1",
+            "channel": "dubox",
+            "clienttype": "0",
+            "jsToken": self.js_token,
+            "path": remote_path,
+            "autoinit": "1",
+            "target_path": os.path.dirname(remote_path),
+            "block_list": json.dumps(md5_list_json),
+        }
 
-            async with session.post(
-                f"{BASE_TERABOX_URL}/api/precreate",
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                data=data,
-                timeout=10,
-            ) as response:
-                resp_data = await response.json()
-                if "uploadid" in resp_data:
-                    return resp_data["uploadid"]
-                if resp_data.get("errmsg") == 'need verify':
-                    raise TeraboxUnauthorizedError(
-                        "The login session has expired. Please login again and refresh the credentials."
-                    )
-                raise TeraboxApiError(f"File precreate failed: {resp_data}")
+        async with self._request(
+            'POST',
+            f"{BASE_TERABOX_URL}/api/precreate",
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": f"{BASE_TERABOX_URL}/main?category=all",
+            },
+            data=data,
+            timeout=10,
+        ) as response:
+            resp_data = await response.json()
+            if "uploadid" in resp_data:
+                return resp_data["uploadid"]
+            if resp_data.get("errmsg") == 'need verify':
+                raise TeraboxUnauthorizedError(
+                    "The login session has expired. Please login again and refresh the credentials."
+                )
+            raise TeraboxApiError(f"File precreate failed: {resp_data}")
 
     async def _postcreate_file(self, remote_path: str, uploadid: str, file_size: int, md5_list_json: list[str]) -> dict:
-        async with self.get_session(headers={
-            "Referer": BASE_TERABOX_URL + "/main?category=all",
-        }) as session:
-            data = {
-                "isdir": "0",
-                "rtype": "1",
-                "app_id": "250528",
-                "jsToken": self.js_token,
-                "path": remote_path,
-                "uploadid": uploadid,
-                "target_path": os.path.dirname(remote_path) + '/',
-                "size": str(file_size),
-                "block_list": json.dumps(md5_list_json),
-            }
+        data = {
+            "isdir": "0",
+            "rtype": "1",
+            "app_id": "250528",
+            "jsToken": self.js_token,
+            "path": remote_path,
+            "uploadid": uploadid,
+            "target_path": os.path.dirname(remote_path) + '/',
+            "size": str(file_size),
+            "block_list": json.dumps(md5_list_json),
+        }
 
-            async with session.post(
-                f"{BASE_TERABOX_URL}/api/create",
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                data=data,
-                timeout=10,
-            ) as response:
-                resp_data = await response.json()
-                if resp_data.get("errno") == 0:
-                    return resp_data
-                raise TeraboxApiError(f"File create failed: {resp_data}")
+        async with self._request(
+            'POST',
+            f"{BASE_TERABOX_URL}/api/create",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data=data,
+            timeout=10,
+        ) as response:
+            resp_data = await response.json()
+            if resp_data.get("errno") == 0:
+                return resp_data
+            raise TeraboxApiError(f"File create failed: {resp_data}")
 
     async def _locate_upload_host(self) -> str:
         """Locate the upload server."""
-        async with self.get_session(headers={
-            "Referer": BASE_TERABOX_URL + "/main?category=all",
-        }) as session:
-            async with session.get(
-                "https://d.terabox.com/rest/2.0/pcs/file?method=locateupload",
-            ) as response:
-                resp_data = await response.json(content_type=None)
-                host = resp_data.get("host")
-                if not host:
-                    raise TeraboxApiError(f"Locate upload server failed: {resp_data}")
-                return host
+        async with self._request(
+            'GET',
+            "https://d.terabox.com/rest/2.0/pcs/file?method=locateupload",
+        ) as response:
+            resp_data = await response.json(content_type=None)
+            host = resp_data.get("host")
+            if not host:
+                raise TeraboxApiError(f"Locate upload server failed: {resp_data}")
+            return host
 
     async def upload_file(self, file: IOBase, destination_path: str) -> dict:
         """Upload a file to TeraBox.
@@ -410,28 +433,30 @@ class TeraBoxClient:
 
         """
 
-        async with self.get_session(headers={
-            "Referer": BASE_TERABOX_URL + "/main?category=all",
-        }) as session:
-            data = {
-                "app_id": "250528",
-                "web": "1",
-                "channel": "dubox",
-                "clienttype": "0",
-                "jsToken": self.js_token,
-                "filelist": json.dumps(remote_paths),
-            }
+        data = {
+            "app_id": "250528",
+            "web": "1",
+            "channel": "dubox",
+            "clienttype": "0",
+            "jsToken": self.js_token,
+            "filelist": json.dumps(remote_paths),
+        }
 
-            async with session.post(
-                f"{BASE_TERABOX_URL}/api/filemanager?opera={operation}&jsToken={self.js_token}",
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                data=data,
-                timeout=10,
-            ) as response:
-                resp_data = await response.json()
-                if resp_data.get("errno") == 0:
-                    return resp_data
-                raise TeraboxApiError(f"File delete failed: {resp_data}")
+        async with self._request(
+            'POST',
+            f"{BASE_TERABOX_URL}/api/filemanager",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            params={
+                'opera': operation,
+                'jsToken': self.js_token,
+            },
+            data=data,
+            timeout=10,
+        ) as response:
+            resp_data = await response.json()
+            if resp_data.get("errno") == 0:
+                return resp_data
+            raise TeraboxApiError(f"File delete failed: {resp_data}")
 
     async def delete_files(self, remote_paths: list[str]) -> dict:
         """Delete a file from TeraBox.
@@ -481,175 +506,152 @@ class TeraBoxClient:
 
     async def get_public_key(self) -> str:
         if self._public_key is None:
-            async with aiohttp.ClientSession(
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Origin": BASE_TERABOX_URL,
-                    "Referer": BASE_TERABOX_URL + "/main",
-                },
-            ) as session:
-                async with session.get(
-                    f"{BASE_TERABOX_URL}/passport/getpubkey",
-                    timeout=10,
-                ) as response:
-                    data = await response.json()
-                    self._public_key = decrypt_aes(data['data']['pp1'], data['data']['pp2'])
-        return self._public_key
-
-    @staticmethod
-    async def fetch_initial_data() -> dict:
-        async with aiohttp.ClientSession(
-            headers={
-                "User-Agent": USER_AGENT,
-                "Origin": BASE_TERABOX_URL,
-                "Referer": BASE_TERABOX_URL + "/main",
-            },
-        ) as session:
-            async with session.get(
-                f"{BASE_TERABOX_URL}/main",
-                timeout=10,
-            ) as response:
-                text = await response.text()
-                tdata_rx = re.compile(r'<script>var templateData = (.*);</script>')
-                js_token_rx = re.compile(r'window.jsToken%20%3D%20a%7D%3Bfn%28%22(.*)%22%29')
-
-                # {'bdstoken': '', 'pcftoken': '98**20',
-                # 'newDomain': {'origin': 'https://www.terabox.com', 'host': 'www.terabox.com',
-                # 'domain': 'terabox.com', 'cdn': 'https://s3.teraboxcdn.com',
-                # 'isGCP': False, 'originalPrefix': 'www', 'regionDomainPrefix': 'www', 'urlDomainPrefix': 'www'},
-                # 'internal': False, 'country': '', 'userVipIdentity': 0, 'uk': 0}
-                tdata = json.loads(tdata_rx.search(text).group(1))
-                js_token = js_token_rx.search(text).group(1)
-
-                return {
-                    'bdstoken': tdata.get('bdstoken', ''),
-                    'pcftoken': tdata.get('pcftoken', ''),
-                    'js_token': js_token,
-                    'cookies': {cookie.key: cookie.value for cookie in session.cookie_jar},
-                }
-
-    @classmethod
-    async def _prelogin(cls, email: str) -> tuple[dict, dict]:
-        initial_vars = await cls.fetch_initial_data()
-
-        async with aiohttp.ClientSession(
-            headers={
-                "User-Agent": USER_AGENT,
-                "Origin": BASE_TERABOX_URL,
-                "Referer": BASE_TERABOX_URL + "/main",
-            },
-            cookies=initial_vars['cookies'],
-        ) as session:
-            async with session.post(
-                f"{BASE_TERABOX_URL}/passport/prelogin",
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                data={
-                    'client': 'web',
-                    'pass_version': '2.8',
-                    'clientfrom': 'h5',
-                    'pcftoken': initial_vars['pcftoken'],
-                    'email': email,
-                },
+            async with self._request(
+                'GET',
+                f"{BASE_TERABOX_URL}/passport/getpubkey",
                 timeout=10,
             ) as response:
                 data = await response.json()
-                return initial_vars, data['data']
+                self._public_key = decrypt_aes(data['data']['pp1'], data['data']['pp2'])
+        return self._public_key
+
+    async def fetch_initial_data(self) -> dict:
+        async with self._request(
+            'GET',
+            f"{BASE_TERABOX_URL}/main",
+            clean_cookies=True,
+            timeout=10,
+        ) as response:
+            text = await response.text()
+            tdata_rx = re.compile(r'<script>var templateData = (.*);</script>')
+            js_token_rx = re.compile(r'window.jsToken%20%3D%20a%7D%3Bfn%28%22(.*)%22%29')
+
+            # {'bdstoken': '', 'pcftoken': '98**20',
+            # 'newDomain': {'origin': 'https://www.terabox.com', 'host': 'www.terabox.com',
+            # 'domain': 'terabox.com', 'cdn': 'https://s3.teraboxcdn.com',
+            # 'isGCP': False, 'originalPrefix': 'www', 'regionDomainPrefix': 'www', 'urlDomainPrefix': 'www'},
+            # 'internal': False, 'country': '', 'userVipIdentity': 0, 'uk': 0}
+            tdata = json.loads(tdata_rx.search(text).group(1))
+            js_token = js_token_rx.search(text).group(1)
+
+            return {
+                'bdstoken': tdata.get('bdstoken', ''),
+                'pcftoken': tdata.get('pcftoken', ''),
+                'js_token': js_token,
+                'cookies': {cookie.key: cookie.value for cookie in self.session.cookie_jar},
+            }
+
+    async def _prelogin(self, email: str) -> tuple[dict, dict]:
+        initial_vars = await self.fetch_initial_data()
+
+        async with self._request(
+            'POST',
+            f"{BASE_TERABOX_URL}/passport/prelogin",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            clean_cookies=True,
+            cookies=initial_vars['cookies'],
+            data={
+                'client': 'web',
+                'pass_version': '2.8',
+                'clientfrom': 'h5',
+                'pcftoken': initial_vars['pcftoken'],
+                'email': email,
+            },
+            timeout=10,
+        ) as response:
+            data = await response.json()
+            return initial_vars, data['data']
 
     async def do_email_login(self) -> dict:
         initial_vars, prelogin = await self._prelogin(self.email)
 
-        async with aiohttp.ClientSession(
-            headers={
-                "User-Agent": USER_AGENT,
-                "Origin": BASE_TERABOX_URL,
-                "Referer": BASE_TERABOX_URL + "/main",
-            },
+        encpass = change_base64_type(encrypt_rsa(self.password, await self.get_public_key(), 2), 2)
+        # print('cookies before', {cookie.key: cookie.value for cookie in session.cookie_jar})
+        prand = prand_gen(
+            client='web',
+            seval=prelogin['seval'],
+            encpwd=encpass,
+            email=self.email,
+            browserid=initial_vars['cookies']['browserid'],
+            random=prelogin['random'],
+        )
+
+        async with self._request(
+            'POST',
+            f"{BASE_TERABOX_URL}/passport/login",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            clean_cookies=True,
             cookies=initial_vars['cookies'],
-        ) as session:
-            encpass = change_base64_type(encrypt_rsa(self.password, await self.get_public_key(), 2), 2)
-            # print('cookies before', {cookie.key: cookie.value for cookie in session.cookie_jar})
-            prand = prand_gen(
-                client='web',
-                seval=prelogin['seval'],
-                encpwd=encpass,
-                email=self.email,
-                browserid=initial_vars['cookies']['browserid'],
-                random=prelogin['random'],
-            )
+            data={
+                'client': 'web',
+                'pass_version': '2.8',
+                'clientfrom': 'h5',
+                'pcftoken': initial_vars['pcftoken'],
+                'prand': prand,
+                'email': self.email,
+                'pwd': encpass,
+                'seval': prelogin['seval'],
+                'random': prelogin['random'],
+                'timestamp': prelogin['timestamp'],
+            },
+            timeout=10,
+        ) as response:
+            data = await response.json()
+            # print('initial data = ', initial_vars)
+            # print('cookies after', {cookie.key: cookie.value for cookie in session.cookie_jar})
+            # print('login data = ', data)
 
-            async with session.post(
-                f"{BASE_TERABOX_URL}/passport/login",
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                data={
-                    'client': 'web',
-                    'pass_version': '2.8',
-                    'clientfrom': 'h5',
-                    'pcftoken': initial_vars['pcftoken'],
-                    'prand': prand,
-                    'email': self.email,
-                    'pwd': encpass,
-                    'seval': prelogin['seval'],
-                    'random': prelogin['random'],
-                    'timestamp': prelogin['timestamp'],
-                },
+            # {
+            #   'code': 0,
+            #   'data': {
+            #     'cur_country': 'US',
+            #     'displayName': 'USER12345678',
+            #     'headUrl': 'https://data.terabox.com/issue/netdisk/ts_ad/group/12345678.png',
+            #     'need_protect': 0,
+            #     'reg_country': 'US',
+            #     'reg_time': 1234567890,
+            #     'region_domain_prefix': 'www',
+            #     'url_domain_prefix': 'www'
+            #   },
+            #   'logid': 1234567890,
+            #   'msg': ''
+            # }
+            if data['code'] != 0:
+                raise TeraboxUnauthorizedError(f"Login failed: {data['errmsg']}")
+            self._cookies.update({cookie.key: cookie.value for cookie in self.session.cookie_jar})
+
+            # convert camelCase to snake_case to match passport/get_info response
+            rename_map = {
+                'displayName': 'display_name',
+                'headUrl': 'head_url',
+            }
+            self._current_user = {rename_map.get(k, k): v for k, v in data['data'].items()}
+
+            # we need to update jstoken after login because it changes to a shorter, authorized one
+            async with self._request(
+                'GET',
+                f"{BASE_TERABOX_URL}/main",
                 timeout=10,
-            ) as response:
-                data = await response.json()
-                # print('initial data = ', initial_vars)
-                # print('cookies after', {cookie.key: cookie.value for cookie in session.cookie_jar})
-                # print('login data = ', data)
+            ) as logged_response:
+                resp = await logged_response.text()
+                js_token_rx = re.compile(r'templateData.*?window.jsToken%20%3D%20a%7D%3Bfn%28%22(.*?)%22%29')
+                self._cookies['js_token'] = js_token_rx.search(resp).group(1)
 
-                # {
-                #   'code': 0,
-                #   'data': {
-                #     'cur_country': 'US',
-                #     'displayName': 'USER12345678',
-                #     'headUrl': 'https://data.terabox.com/issue/netdisk/ts_ad/group/12345678.png',
-                #     'need_protect': 0,
-                #     'reg_country': 'US',
-                #     'reg_time': 1234567890,
-                #     'region_domain_prefix': 'www',
-                #     'url_domain_prefix': 'www'
-                #   },
-                #   'logid': 1234567890,
-                #   'msg': ''
-                # }
-                if data['code'] != 0:
-                    raise TeraboxUnauthorizedError(f"Login failed: {data['errmsg']}")
-                self._cookies.update({cookie.key: cookie.value for cookie in session.cookie_jar})
-
-                # convert camelCase to snake_case to match passport/get_info response
-                rename_map = {
-                    'displayName': 'display_name',
-                    'headUrl': 'head_url',
-                }
-                self._current_user = {rename_map.get(k, k): v for k, v in data['data'].items()}
-
-                # we need to update jstoken after login because it changes to a shorter, authorized one
-                async with session.get(
-                    f"{BASE_TERABOX_URL}/main",
-                    timeout=10,
-                ) as logged_response:
-                    resp = await logged_response.text()
-                    js_token_rx = re.compile(r'templateData.*?window.jsToken%20%3D%20a%7D%3Bfn%28%22(.*?)%22%29')
-                    self._cookies['js_token'] = js_token_rx.search(resp).group(1)
-
-                return data
+            return data
 
     async def ensure_logged_in(self) -> dict:
-        async with self.get_session() as session:
-            async with session.get(f"{BASE_TERABOX_URL}/passport/get_info", timeout=10) as response:
-                data = await response.json()
-                if data.get("code") != 0:
-                    raise TeraboxUnauthorizedError(f"Login failed: {data['msg']}")
-                self._current_user = data['data']
-                return self._current_user
+        async with self._request('GET', f"{BASE_TERABOX_URL}/passport/get_info", timeout=10) as response:
+            data = await response.json()
+            if data.get("code") != 0:
+                raise TeraboxUnauthorizedError(f"Login failed: {data['msg']}")
+            self._current_user = data['data']
+            return self._current_user
 
     async def login(self) -> dict[str, str] | None:
         """Login to TeraBox. Returns True if login was performed, False if already logged in."""
         if (
-            self._cookies['js_token'] and
-            self._cookies['csrf_token'] and
+            self._cookies['jstoken'] and
+            self._cookies['csrfToken'] and
             self._cookies['browserid'] and
             self._cookies['ndus']
         ):
@@ -663,8 +665,11 @@ class TeraBoxClient:
         return self._cookies
 
     async def get_storage_quota(self) -> dict[str, Any]:
-        async with self.get_session() as session:
-            async with session.get(f"{BASE_TERABOX_URL}/api/quota?checkexpire=1&checkfree=1", timeout=10) as response:
+            async with self._request(
+                'GET',
+                f"{BASE_TERABOX_URL}/api/quota?checkexpire=1&checkfree=1",
+                timeout=10,
+            ) as response:
                 data = await response.json()
                 if data.get("errno") != 0:
                     raise TeraboxApiError(f"Get quota failed: {data}")
