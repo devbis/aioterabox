@@ -6,7 +6,7 @@ import os
 import re
 from io import IOBase
 from tempfile import TemporaryDirectory
-from typing import NamedTuple, TypedDict, get_type_hints
+from typing import NamedTuple, TypedDict, get_type_hints, Any
 from urllib.parse import quote_plus
 
 import aiohttp
@@ -661,3 +661,30 @@ class TeraBoxClient:
                 return None
         await self.do_email_login()
         return self._cookies
+
+    async def get_storage_quota(self) -> dict[str, Any]:
+        async with self.get_session() as session:
+            async with session.get(f"{BASE_TERABOX_URL}/api/quota?checkexpire=1&checkfree=1", timeout=10) as response:
+                data = await response.json()
+                if data.get("errno") != 0:
+                    raise TeraboxApiError(f"Get quota failed: {data}")
+
+                # {
+                #   'errmsg': '',
+                #   'errno': 0,
+                #   'expire': False,
+                #   'extra': {
+                #     'init_quota_type': 'permanent_1024g_temp_0g',
+                #     'time_limit_quota_expire_time': 0
+                #   },
+                #   'free': 1099511627776,
+                #   'newno': '',
+                #   'request_id': 123123123123,
+                #   'sbox_used': 0,
+                #   'server_time': 1234567890,
+                #   'total': 1099511627776,
+                #   'used': 5811486
+                # }
+
+                data["available"] = data["total"] - data["used"]
+                return data
