@@ -537,7 +537,7 @@ class TeraBoxClient:
             return {
                 'bdstoken': tdata.get('bdstoken', ''),
                 'pcftoken': tdata.get('pcftoken', ''),
-                'js_token': js_token,
+                'jstoken': js_token,
                 'cookies': {cookie.key: cookie.value for cookie in self.session.cookie_jar},
             }
 
@@ -560,6 +560,8 @@ class TeraBoxClient:
             timeout=10,
         ) as response:
             data = await response.json()
+            if data['code'] != 0:
+                raise TeraboxUnauthorizedError(f"Prelogin failed: {data['msg']}")
             return initial_vars, data['data']
 
     async def do_email_login(self) -> dict:
@@ -635,7 +637,7 @@ class TeraBoxClient:
             ) as logged_response:
                 resp = await logged_response.text()
                 js_token_rx = re.compile(r'templateData.*?window.jsToken%20%3D%20a%7D%3Bfn%28%22(.*?)%22%29')
-                self._cookies['js_token'] = js_token_rx.search(resp).group(1)
+                self._cookies['jstoken'] = js_token_rx.search(resp).group(1)
 
             return data
 
