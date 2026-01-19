@@ -6,7 +6,7 @@ import os
 import re
 from io import IOBase
 from tempfile import TemporaryDirectory
-from typing import NamedTuple
+from typing import NamedTuple, TypedDict, get_type_hints
 from urllib.parse import quote_plus
 
 import aiohttp
@@ -25,6 +25,13 @@ BASE_TERABOX_URL = "https://www.terabox.com"
 MAX_UNCHUNKED_FILE_SIZE = 2147483648  # 2 GB
 CHUNK_SIZE = 120 * 1024 * 1024
 READ_BUF = 4 * 1024 * 1024  # 4 MB
+
+
+class TeraboxCookies(TypedDict):
+    js_token: str  # not a cookie but we store it here for convenience
+    csrf_token: str
+    browserid: str
+    ndus: str
 
 
 class FileInfo(NamedTuple):
@@ -78,34 +85,36 @@ def prand_gen(client: str, seval: str, encpwd: str, email: str, browserid: str, 
 
 
 class TeraBoxClient:
-    def __init__(self, jstoken: str, csrf_token: str, browserid: str, ndus: str, # ndut_fmt: str,
-                 lang: str = 'en') -> None:
-        self.jstoken = jstoken
-        self.csrf_token = csrf_token
-        self.browserid = browserid
-        self.ndus = ndus
-        # self.ndut_fmt = ndut_fmt
+    def __init__(self, email: str, password: str, cookies: dict[str, str] | None = None, lang: str = 'en') -> None:
+        self.email = email
+        self.password = password
         self.lang = lang
 
+        required_cookie_keys = list(get_type_hints(TeraboxCookies).keys())
+        if cookies is not None:
+            missing_keys = [key for key in required_cookie_keys if key not in cookies]
+            if missing_keys:
+                raise ValueError(f"Missing required cookie keys: {', '.join(missing_keys)}")
+
+        self._cookies: TeraboxCookies = TeraboxCookies(**cookies) if cookies else TeraboxCookies(**{
+            k: '' for k in required_cookie_keys
+        })
+
         self.is_vip: bool | None = None
-
         self._public_key: str | None = None
-        self._session_cookies1: dict[str, str] = {}
-
-        self._session_cookies: dict[str, str] = {
-            'csrfToken': self.csrf_token,
-            'browserid': self.browserid,
-            'lang': self.lang,
-            'ndus': self.ndus,
-        }
+        self._current_user: dict | None = None
 
     @property
     def request_cookies(self) -> dict[str, str]:
         """Get the cookies needed for requests."""
         return {
-            **self._session_cookies,
-            'lang': self.lang,
+            **{k: v for k, v in self._cookies.items() if v},
+            **({'lang': self.lang} if 'lang' not in self._cookies else {}),
         }
+
+    @property
+    def js_token(self) -> str:
+        return self._cookies['js_token']
 
     @staticmethod
     def file_md5(file: IOBase, chunk_size=1024 * 1024) -> str:
@@ -163,7 +172,7 @@ class TeraBoxClient:
                     "web": "1",
                     "channel": "dubox",
                     "clienttype": "5",  # This changed from 0 to 5 in 2025
-                    "jsToken": self.jstoken,
+                    "jsToken": self.js_token,
                     "dir": f"/{remote_dir.lstrip('/')}",  # Leading slash is now required
                     "num": "1000",
                     "page": "1",
@@ -245,7 +254,7 @@ class TeraBoxClient:
                 "web": "1",
                 "channel": "dubox",
                 "clienttype": "0",
-                "jsToken": self.jstoken,
+                "jsToken": self.js_token,
                 "path": remote_path,
                 "autoinit": "1",
                 "target_path": os.path.dirname(remote_path),
@@ -275,7 +284,7 @@ class TeraBoxClient:
                 "isdir": "0",
                 "rtype": "1",
                 "app_id": "250528",
-                "jsToken": self.jstoken,
+                "jsToken": self.js_token,
                 "path": remote_path,
                 "uploadid": uploadid,
                 "target_path": os.path.dirname(remote_path) + '/',
@@ -409,12 +418,12 @@ class TeraBoxClient:
                 "web": "1",
                 "channel": "dubox",
                 "clienttype": "0",
-                "jsToken": self.jstoken,
+                "jsToken": self.js_token,
                 "filelist": json.dumps(remote_paths),
             }
 
             async with session.post(
-                f"{BASE_TERABOX_URL}/api/filemanager?opera={operation}&jsToken={self.jstoken}",
+                f"{BASE_TERABOX_URL}/api/filemanager?opera={operation}&jsToken={self.js_token}",
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
                 data=data,
                 timeout=10,
@@ -487,7 +496,8 @@ class TeraBoxClient:
                     self._public_key = decrypt_aes(data['data']['pp1'], data['data']['pp2'])
         return self._public_key
 
-    async def fetch_initial_data(self) -> dict:
+    @staticmethod
+    async def fetch_initial_data() -> dict:
         async with aiohttp.ClientSession(
             headers={
                 "User-Agent": USER_AGENT,
@@ -518,8 +528,9 @@ class TeraBoxClient:
                     'cookies': {cookie.key: cookie.value for cookie in session.cookie_jar},
                 }
 
-    async def prelogin(self, email: str) -> tuple[dict, dict]:
-        initial_vars = await self.fetch_initial_data()
+    @classmethod
+    async def _prelogin(cls, email: str) -> tuple[dict, dict]:
+        initial_vars = await cls.fetch_initial_data()
 
         async with aiohttp.ClientSession(
             headers={
@@ -544,9 +555,8 @@ class TeraBoxClient:
                 data = await response.json()
                 return initial_vars, data['data']
 
-
-    async def login(self, email: str, password: str) -> dict:
-        initial_vars, prelogin = await self.prelogin(email)
+    async def do_email_login(self) -> dict:
+        initial_vars, prelogin = await self._prelogin(self.email)
 
         async with aiohttp.ClientSession(
             headers={
@@ -556,13 +566,13 @@ class TeraBoxClient:
             },
             cookies=initial_vars['cookies'],
         ) as session:
-            encpass = change_base64_type(encrypt_rsa(password, await self.get_public_key(), 2), 2)
+            encpass = change_base64_type(encrypt_rsa(self.password, await self.get_public_key(), 2), 2)
             # print('cookies before', {cookie.key: cookie.value for cookie in session.cookie_jar})
             prand = prand_gen(
                 client='web',
                 seval=prelogin['seval'],
                 encpwd=encpass,
-                email=email,
+                email=self.email,
                 browserid=initial_vars['cookies']['browserid'],
                 random=prelogin['random'],
             )
@@ -576,7 +586,7 @@ class TeraBoxClient:
                     'clientfrom': 'h5',
                     'pcftoken': initial_vars['pcftoken'],
                     'prand': prand,
-                    'email': email,
+                    'email': self.email,
                     'pwd': encpass,
                     'seval': prelogin['seval'],
                     'random': prelogin['random'],
@@ -588,12 +598,33 @@ class TeraBoxClient:
                 # print('initial data = ', initial_vars)
                 # print('cookies after', {cookie.key: cookie.value for cookie in session.cookie_jar})
                 # print('login data = ', data)
+
+                # {
+                #   'code': 0,
+                #   'data': {
+                #     'cur_country': 'US',
+                #     'displayName': 'USER12345678',
+                #     'headUrl': 'https://data.terabox.com/issue/netdisk/ts_ad/group/12345678.png',
+                #     'need_protect': 0,
+                #     'reg_country': 'US',
+                #     'reg_time': 1234567890,
+                #     'region_domain_prefix': 'www',
+                #     'url_domain_prefix': 'www'
+                #   },
+                #   'logid': 1234567890,
+                #   'msg': ''
+                # }
                 if data['code'] != 0:
                     raise TeraboxUnauthorizedError(f"Login failed: {data['errmsg']}")
-                self.ndus = session.cookie_jar.filter_cookies(BASE_TERABOX_URL).get('ndus').value
-                self._session_cookies = {cookie.key: cookie.value for cookie in session.cookie_jar}
+                self._cookies.update({cookie.key: cookie.value for cookie in session.cookie_jar})
 
-                self.jstoken = initial_vars['js_token']
+                # convert camelCase to snake_case to match passport/get_info response
+                rename_map = {
+                    'displayName': 'display_name',
+                    'headUrl': 'head_url',
+                }
+                self._current_user = {rename_map.get(k, k): v for k, v in data['data'].items()}
+
                 # we need to update jstoken after login because it changes to a shorter, authorized one
                 async with session.get(
                     f"{BASE_TERABOX_URL}/main",
@@ -601,6 +632,32 @@ class TeraBoxClient:
                 ) as logged_response:
                     resp = await logged_response.text()
                     js_token_rx = re.compile(r'templateData.*?window.jsToken%20%3D%20a%7D%3Bfn%28%22(.*?)%22%29')
-                    self.jstoken = js_token_rx.search(resp).group(1)
+                    self._cookies['js_token'] = js_token_rx.search(resp).group(1)
 
                 return data
+
+    async def ensure_logged_in(self) -> dict:
+        async with self.get_session() as session:
+            async with session.get(f"{BASE_TERABOX_URL}/passport/get_info", timeout=10) as response:
+                data = await response.json()
+                if data.get("code") != 0:
+                    raise TeraboxUnauthorizedError(f"Login failed: {data['msg']}")
+                self._current_user = data['data']
+                return self._current_user
+
+    async def login(self) -> dict[str, str] | None:
+        """Login to TeraBox. Returns True if login was performed, False if already logged in."""
+        if (
+            self._cookies['js_token'] and
+            self._cookies['csrf_token'] and
+            self._cookies['browserid'] and
+            self._cookies['ndus']
+        ):
+            try:
+                await self.ensure_logged_in()
+            except TeraboxUnauthorizedError:
+                pass
+            else:
+                return None
+        await self.do_email_login()
+        return self._cookies
