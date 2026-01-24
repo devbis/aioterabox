@@ -21,7 +21,8 @@ from .exceptions import (
     TeraboxUnauthorizedError,
 )
 
-USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.2; rv:121.0) Gecko/20100101 Firefox/121.0"
+USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.190 Safari/537.36'
+#USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.2; rv:121.0) Gecko/20100101 Firefox/121.0"
 BASE_TERABOX_URL = "https://www.terabox.com"
 INITIAL_URL = "https://www.terabox.app/wap/share/filelist?surl=12345678"
 MAX_UNCHUNKED_FILE_SIZE = 2147483648  # 2 GB
@@ -100,6 +101,8 @@ class TeraBoxClient:
             "User-Agent": USER_AGENT,
             "Origin": BASE_TERABOX_URL,
             "Referer": BASE_TERABOX_URL + "/main",
+            "Accept": "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest",
         }
 
         self.is_vip: bool | None = None
@@ -154,7 +157,7 @@ class TeraBoxClient:
         }
 
         merged_cookies = {
-            **(self._cookies if not clean_cookies else {}),
+            **(self.request_cookies if not clean_cookies else {}),
             **(cookies or {}),
         } or None
 
@@ -549,8 +552,11 @@ class TeraBoxClient:
         async with self._request(
             'POST',
             f"{BASE_TERABOX_URL}/passport/prelogin",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            clean_cookies=True,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": "https://www.terabox.com/wap/outlogin/emailRegister?tab=1",
+                },
+            #clean_cookies=True,
             cookies=initial_vars['cookies'],
             data={
                 'client': 'web',
@@ -576,7 +582,7 @@ class TeraBoxClient:
             seval=prelogin['seval'],
             encpwd=encpass,
             email=self.email,
-            browserid=initial_vars['cookies']['browserid'],
+            browserid=initial_vars['cookies'].get('browserid'),
             random=prelogin['random'],
         )
 
