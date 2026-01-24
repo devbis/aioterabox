@@ -23,6 +23,7 @@ from .exceptions import (
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.2; rv:121.0) Gecko/20100101 Firefox/121.0"
 BASE_TERABOX_URL = "https://www.terabox.com"
+INITIAL_URL = "https://www.terabox.app/wap/share/filelist?surl=12345678"
 MAX_UNCHUNKED_FILE_SIZE = 2147483648  # 2 GB
 CHUNK_SIZE = 120 * 1024 * 1024
 READ_BUF = 4 * 1024 * 1024  # 4 MB
@@ -155,7 +156,7 @@ class TeraBoxClient:
         merged_cookies = {
             **(self._cookies if not clean_cookies else {}),
             **(cookies or {}),
-        }
+        } or None
 
         resp = await self.session.request(
             method,
@@ -515,16 +516,16 @@ class TeraBoxClient:
                 self._public_key = decrypt_aes(data['data']['pp1'], data['data']['pp2'])
         return self._public_key
 
-    async def fetch_initial_data(self) -> dict:
+    async def fetch_initial_data(self, url: str = INITIAL_URL) -> dict:
         async with self._request(
             'GET',
-            f"{BASE_TERABOX_URL}/main",
+            url,
             clean_cookies=True,
             timeout=10,
         ) as response:
             text = await response.text()
-            tdata_rx = re.compile(r'<script>var templateData = (.*);</script>')
-            js_token_rx = re.compile(r'window.jsToken%20%3D%20a%7D%3Bfn%28%22(.*)%22%29')
+            tdata_rx = re.compile(r'<script>var templateData = (.*?);</script>')
+            js_token_rx = re.compile(r'window.jsToken%20%3D%20a%7D%3Bfn%28%22(.*?)%22%29')
 
             # {'bdstoken': '', 'pcftoken': '98**20',
             # 'newDomain': {'origin': 'https://www.terabox.com', 'host': 'www.terabox.com',
@@ -532,7 +533,8 @@ class TeraBoxClient:
             # 'isGCP': False, 'originalPrefix': 'www', 'regionDomainPrefix': 'www', 'urlDomainPrefix': 'www'},
             # 'internal': False, 'country': '', 'userVipIdentity': 0, 'uk': 0}
             tdata = json.loads(tdata_rx.search(text).group(1))
-            js_token = js_token_rx.search(text).group(1)
+            js_token_res = js_token_rx.search(text)
+            js_token = js_token_rx.search(text).group(1) if js_token_res else ''
 
             return {
                 'bdstoken': tdata.get('bdstoken', ''),
