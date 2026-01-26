@@ -12,7 +12,7 @@ from urllib.parse import quote_plus
 
 import aiohttp
 
-from .encryption import change_base64_type, decrypt_aes, encrypt_rsa
+from .encryption import change_base64_type, decrypt_aes, encrypt_rsa, sign_download
 from .exceptions import (
     TeraboxApiError,
     TeraboxChecksumMismatchError,
@@ -106,6 +106,7 @@ class TeraBoxClient:
         }
 
         self.is_vip: bool | None = None
+        self._signb: str | None = None
         self._public_key: str | None = None
         self._current_user: dict | None = None
 
@@ -343,6 +344,73 @@ class TeraBoxClient:
             if not host:
                 raise TeraboxApiError(f"Locate upload server failed: {resp_data}")
             return host
+
+    async def _get_home_info(self) -> str:
+        """Get home info to retrieve user details."""
+        if self._signb is None:
+            async with self._request(
+                'GET',
+                f"{BASE_TERABOX_URL}/api/home/info",
+                params={
+                    "app_id": "250528",
+                    "web": "1",
+                    "channel": "dubox",
+                    "clienttype": "0",
+                    "jsToken": self.js_token,
+                },
+                timeout=10,
+            ) as response:
+                resp_data = await response.json()
+                if resp_data.get("errno") != 0:
+                    raise TeraboxApiError(f"Get home info failed: {resp_data}")
+                self._signb = sign_download(resp_data['data']['sign3'], resp_data['data']['sign1'])
+        return self._signb
+
+    async def get_files_meta(self, remote_file_list: list[str]) -> dict:
+        """Get file metadata from TeraBox."""
+        await self._get_home_info()
+        data = {
+            "target": json.dumps(remote_file_list),
+            "dlink": "1",
+            "origin": "dlna",
+        }
+
+        async with self._request(
+            'POST',
+            f"{BASE_TERABOX_URL}/api/filemetas",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data=data,
+            timeout=10,
+        ) as response:
+            resp_data = await response.json()
+            if resp_data.get("errno") == 0:
+                return resp_data['info']
+            raise TeraboxApiError(f"Get file metadata failed: {resp_data}")
+
+    # async def download_file(self, remote_path: str) -> str:
+    #     """Download a file from TeraBox."""
+    #     await self._get_home_info()
+    #     data = {
+    #         "fidlist": json.dumps([remote_path]),
+    #         "type": "dlink",
+    #         "vip": 2,
+    #         "sign": self._signb or '',
+    #         "timestamp": "0",
+    #         "need_speed": "1",
+    #     }
+    #
+    #     async with self._request(
+    #         'POST',
+    #         f"{BASE_TERABOX_URL}/api/download",
+    #         headers={"Content-Type": "application/x-www-form-urlencoded"},
+    #         data=data,
+    #         timeout=10,
+    #     ) as response:
+    #         resp_data = await response.json()
+    #         print(resp_data)
+    #         if resp_data.get("errno") == 0:
+    #             return resp_data["dlink"]
+    #         raise TeraboxApiError(f"File download failed: {resp_data}")
 
     async def upload_file(self, file: IOBase, destination_path: str) -> dict:
         """Upload a file to TeraBox.

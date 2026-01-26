@@ -73,3 +73,28 @@ def encrypt_rsa(message: str, public_key_pem: str, mode: int = 1) -> str:
 
     # Return as Base64 string
     return base64.b64encode(encrypted).decode("utf-8")
+
+
+def sign_download(s1: str, s2: str) -> str:
+    # Initialize permutation array (p) and key array (a)
+    p = list(range(256))
+    a = [ord(s1[i % len(s1)]) for i in range(256)]
+    result = []
+
+    # Key-scheduling algorithm (KSA)
+    j = 0
+    for i in range(256):
+        j = (j + p[i] + a[i]) % 256
+        p[i], p[j] = p[j], p[i]  # swap
+
+    # Pseudo-random generation algorithm (PRGA)
+    i = j = 0
+    for q in range(len(s2)):
+        i = (i + 1) % 256
+        j = (j + p[i]) % 256
+        p[i], p[j] = p[j], p[i]  # swap
+        k = p[(p[i] + p[j]) % 256]
+        result.append(ord(s2[q]) ^ k)
+
+    # Return the result as Base64
+    return base64.b64encode(bytes(result)).decode("utf-8")
