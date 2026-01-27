@@ -477,9 +477,11 @@ class TeraBoxClient:
             timeout=10,
         ) as response:
             resp_data = await response.json()
-            if resp_data.get("errno") == 0:
-                return resp_data['info']
-            raise TeraboxApiError(f"Get file metadata failed: {resp_data}")
+            if any(x.get('errno') == -9 for x in resp_data.get('info', [])):
+                raise TeraboxNotFoundError('File not found.')
+            if resp_data.get("errno") != 0:
+                raise TeraboxApiError(f"Get file metadata failed: {resp_data}")
+            return resp_data['info']
 
     # async def download_file(self, remote_path: str) -> str:
     #     """Download a file from TeraBox."""
