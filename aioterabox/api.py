@@ -234,6 +234,43 @@ class TeraBoxClient:
                 for entry in response
             ]
 
+    async def create_directory(self, remote_dir: str) -> dict:
+        """Create a remote directory. Can create nested directories."""
+        data = {
+            "path": remote_dir,
+            "isdir": "1",
+            "block_list": "[]",
+        }
+
+        async with self._request(
+            'POST',
+            f"{BASE_TERABOX_URL}/api/create?a=commit",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data=data,
+            timeout=10,
+        ) as response:
+            resp_data = await response.json()
+            # {
+            #   "category": 6,
+            #   "ctime": 1234567890,
+            #   "errmsg": "",
+            #   "errno": 0,
+            #   "from_type": 0,
+            #   "fs_id": 1234567890,
+            #   "isdir": 1,
+            #   "md5": "",
+            #   "mtime": 1234567890,
+            #   "name": "/test_folder1/subfolder",
+            #   "newno": "",
+            #   "path": "/test_folder1/subfolder",
+            #   "request_id": 12345678901234567,
+            #   "server_time": 1234567890,
+            #   "size": 0
+            # }
+            if resp_data.get("errno") == 0:
+                return resp_data
+            raise TeraboxApiError(f"Directory creation failed: {resp_data}")
+
     async def _upload_file_chunk(self, upload_host: str, file: IOBase, remote_path: str, chunk_md5: str, uploadid: str,
                                  partseq: int = 0, max_attempts: int = 6) -> dict:
         """Upload a file chunk to TeraBox."""
@@ -720,6 +757,17 @@ class TeraBoxClient:
     async def ensure_logged_in(self) -> dict:
         async with self._request('GET', f"{BASE_TERABOX_URL}/passport/get_info", timeout=10) as response:
             data = await response.json()
+            # {
+            #     'code': 0,
+            #     'data': {
+            #         'display_name': 'USER1234567',
+            #         'head_url': 'https://data.terabox.com/issue/netdisk/ts_ad/group/123456789012345.png',
+            #         'region_domain_prefix': 'www',
+            #         'url_domain_prefix': 'www'
+            #     },
+            #     'logid': 1234567890,
+            #     'msg': ''
+            # }
             if data.get("code") != 0:
                 raise TeraboxUnauthorizedError(f"Login failed: {data['msg']}")
             self._current_user = data['data']
