@@ -44,6 +44,12 @@ class FileInfo(NamedTuple):
     is_dir: bool = False
 
 
+class AccountInfo(TypedDict):
+    account_id: str | None
+    display_name: str
+    head_url: str
+
+
 class NonClosableIO(io.IOBase):
     def __init__(self, wrapped: io.IOBase):
         self._wrapped = wrapped
@@ -108,7 +114,7 @@ class TeraBoxClient:
         self.is_vip: bool | None = None
         self._signb: str | None = None
         self._public_key: str | None = None
-        self._current_user: dict | None = None
+        self.account: AccountInfo = AccountInfo(account_id=None, display_name='', head_url='')
 
     @property
     def request_cookies(self) -> dict[str, str]:
@@ -189,6 +195,57 @@ class TeraBoxClient:
             vip = data["data"]["member_info"]["is_vip"]
             self.is_vip = vip == 1
             return self.is_vip
+
+    #     async checkLogin(){
+    #         const url = new URL(this.params.whost + '/api/check/login');
+    #
+    #         try{
+    #             const req = await request(url, {
+    #                 headers: {
+    #                     'User-Agent': this.params.ua,
+    #                     'Cookie': this.params.cookie,
+    #                 },
+    #                 signal: AbortSignal.timeout(this.TERABOX_TIMEOUT),
+    #             });
+    #
+    #             if (req.statusCode !== 200) {
+    #                 throw new Error(`HTTP error! Status: ${req.statusCode}`);
+    #             }
+    #
+    #             const regionPrefix = req.headers['region-domain-prefix'];
+    #             if(regionPrefix){
+    #                 const newHostname = `https://${regionPrefix}.${this.TERABOX_DOMAIN}`;
+    #                 console.warn(`[WARN] Default hostname changed to ${newHostname}`);
+    #                 this.params.whost = new URL(newHostname).origin;
+    #                 return await this.checkLogin();
+    #             }
+    #
+    #             const rdata = await req.body.json();
+    #             if(rdata.errno === 0){
+    #                 this.params.account_id = rdata.uk;
+    #             }
+    #             return rdata;
+    #         }
+    #         catch(error){
+    #             throw new Error('checkLogin', { cause: error });
+    #         }
+    #     }
+
+    async def get_account_id(self):
+        """Get the account ID of the current user."""
+        if self.account['account_id'] is None:
+            async with self._request(
+                'GET',
+                f"{BASE_TERABOX_URL}/api/check/login",
+                timeout=10,
+            ) as response:
+                data = await response.json()
+                if data.get("errno") == -6:
+                    raise TeraboxUnauthorizedError('Invalid cookies.')
+                if data.get("errno") != 0:
+                    raise TeraboxApiError(f"API error: {data}")
+                self.account['account_id'] = data.get('uk') or None
+        return self.account['account_id']
 
     async def get_max_file_size(self) -> int:
         """Get the maximum file size allowed for upload."""
@@ -734,13 +791,10 @@ class TeraBoxClient:
             if data['code'] != 0:
                 raise TeraboxUnauthorizedError(f"Login failed: {data['errmsg']}")
             self._cookies.update({cookie.key: cookie.value for cookie in self.session.cookie_jar})
-
-            # convert camelCase to snake_case to match passport/get_info response
-            rename_map = {
-                'displayName': 'display_name',
-                'headUrl': 'head_url',
-            }
-            self._current_user = {rename_map.get(k, k): v for k, v in data['data'].items()}
+            self.account.update({
+                'display_name': data['data']['displayName'],
+                'head_url': data['data']['headUrl'],
+            })
 
             # we need to update jstoken after login because it changes to a shorter, authorized one
             async with self._request(
@@ -754,7 +808,7 @@ class TeraBoxClient:
 
             return data
 
-    async def ensure_logged_in(self) -> dict:
+    async def ensure_logged_in(self) -> AccountInfo:
         async with self._request('GET', f"{BASE_TERABOX_URL}/passport/get_info", timeout=10) as response:
             data = await response.json()
             # {
@@ -770,8 +824,8 @@ class TeraBoxClient:
             # }
             if data.get("code") != 0:
                 raise TeraboxUnauthorizedError(f"Login failed: {data['msg']}")
-            self._current_user = data['data']
-            return self._current_user
+            self.account.update(data['data'])
+            return self.account
 
     async def login(self) -> dict[str, str] | None:
         """Login to TeraBox. Returns True if login was performed, False if already logged in."""
