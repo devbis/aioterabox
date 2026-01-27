@@ -274,7 +274,7 @@ class TeraBoxClient:
         ) as response:
             data = await response.json()
             if "errno" in data and data["errno"] != 0:
-                if data["errno"] == -7:
+                if data["errno"] in {-7, -9}:
                     raise TeraboxNotFoundError('Remote directory not found.')
                 if data["errno"] == -6:
                     raise TeraboxUnauthorizedError('Invalid cookies.')
