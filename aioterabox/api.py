@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -36,6 +37,8 @@ FALLBACK_INITIAL_URLS = (
 MAX_UNCHUNKED_FILE_SIZE = 10 * 1024 * 1024  # 10 mb
 CHUNK_SIZE = 4 * 1024 * 1024
 READ_BUF = 1 * 1024 * 1024  # 1 MB
+UPLOAD_CHUNK_TIMEOUT = 120
+UPLOAD_CHUNK_MAX_ATTEMPTS = 10
 REQUIRED_SESSION_KEYS = ("jstoken", "csrfToken", "browserid", "ndus")
 OPTIONAL_SESSION_KEYS = ("TSID", "shareUpdateRandom", "lang")
 SIMPLE_VERIFY_URL = f"{BASE_TERABOX_URL}/simple-verify"
@@ -450,34 +453,56 @@ class TeraboxClient:
             "Upload file chunk: %s to %s, size: %d, uploadid: %s",
             filename, remote_path, filesize, uploadid,
         )
-        async with aiofiles.open(filename, "rb") as file:
-            data = aiohttp.FormData()
-            data.add_field("file", AioFilePayload(file, filesize=filesize), filename=filename)
+        last_error: Exception | None = None
+        for attempt in range(1, UPLOAD_CHUNK_MAX_ATTEMPTS + 1):
+            try:
+                async with aiofiles.open(filename, "rb") as file:
+                    data = aiohttp.FormData()
+                    data.add_field("file", AioFilePayload(file, filesize=filesize), filename=filename)
 
-            async with self._request(
-                'POST',
-                f"https://{upload_host}/rest/2.0/pcs/superfile2?"
-                f"method=upload&type=tmpfile&app_id=250528&path={quote_plus(remote_path)}&"
-                f"uploadid={uploadid}&partseq={partseq}",
-                data=data,
-                timeout=15,
-            ) as response:
-                content = await response.read()
-                LOGGER.debug("Upload chunk response: %s", content)
+                    async with self._request(
+                        'POST',
+                        f"https://{upload_host}/rest/2.0/pcs/superfile2?"
+                        f"method=upload&type=tmpfile&app_id=250528&path={quote_plus(remote_path)}&"
+                        f"uploadid={uploadid}&partseq={partseq}",
+                        data=data,
+                        timeout=UPLOAD_CHUNK_TIMEOUT,
+                    ) as response:
+                        content = await response.read()
+                        LOGGER.debug("Upload chunk response: %s", content)
 
-                try:
-                    resp = json.loads(content)
-                except json.JSONDecodeError:
-                    raise TeraboxApiError(f"File upload failed: {content.decode(errors='ignore')}") from None
+                        try:
+                            resp = json.loads(content)
+                        except json.JSONDecodeError:
+                            raise TeraboxApiError(
+                                f"File upload failed: {content.decode(errors='ignore')}"
+                            ) from None
 
-        if 'error_code' in resp:
-            if resp['error_code'] == 31208:
-                raise TeraboxContentTypeError(resp['error_msg'])
-            raise TeraboxApiError(f"File upload failed: {resp}")
+                if 'error_code' in resp:
+                    if resp['error_code'] == 31208:
+                        raise TeraboxContentTypeError(resp['error_msg'])
+                    raise TeraboxApiError(f"File upload failed: {resp}")
 
-        if resp['md5'] != chunk_md5:
-            raise TeraboxChecksumMismatchError("MD5 hash mismatch after file upload.")
-        return resp
+                if resp['md5'] != chunk_md5:
+                    raise TeraboxChecksumMismatchError("MD5 hash mismatch after file upload.")
+                return resp
+            except (TimeoutError, aiohttp.ClientError, OSError) as err:
+                last_error = err
+                if attempt >= UPLOAD_CHUNK_MAX_ATTEMPTS:
+                    break
+                LOGGER.warning(
+                    "Retrying upload chunk %s for %s after %s on attempt %d/%d",
+                    partseq,
+                    remote_path,
+                    err.__class__.__name__,
+                    attempt,
+                    UPLOAD_CHUNK_MAX_ATTEMPTS,
+                )
+                await asyncio.sleep(attempt)
+
+        raise TeraboxApiError(
+            f"File upload failed for chunk {partseq} after {UPLOAD_CHUNK_MAX_ATTEMPTS} attempts: {last_error}"
+        ) from last_error
 
     async def _precreate_file(self, remote_path: str, md5_list_json: list[str]) -> str:
         data = {
