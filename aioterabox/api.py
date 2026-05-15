@@ -38,7 +38,9 @@ MAX_UNCHUNKED_FILE_SIZE = 10 * 1024 * 1024  # 10 mb
 CHUNK_SIZE = 4 * 1024 * 1024
 READ_BUF = 1 * 1024 * 1024  # 1 MB
 UPLOAD_CHUNK_TIMEOUT = 120
+UPLOAD_CHUNK_CONNECT_TIMEOUT = 8
 UPLOAD_CHUNK_MAX_ATTEMPTS = 10
+UPLOAD_CHUNK_CONCURRENCY = 1
 REQUIRED_SESSION_KEYS = ("jstoken", "csrfToken", "browserid", "ndus")
 OPTIONAL_SESSION_KEYS = ("TSID", "shareUpdateRandom", "lang")
 SIMPLE_VERIFY_URL = f"{BASE_TERABOX_URL}/simple-verify"
@@ -169,6 +171,15 @@ class TeraboxClient:
                 break
             h.update(chunk)
         return h.hexdigest()
+
+    @staticmethod
+    def _chunk_request_timeout() -> aiohttp.ClientTimeout:
+        return aiohttp.ClientTimeout(
+            total=UPLOAD_CHUNK_TIMEOUT,
+            connect=UPLOAD_CHUNK_CONNECT_TIMEOUT,
+            sock_connect=UPLOAD_CHUNK_CONNECT_TIMEOUT,
+            sock_read=UPLOAD_CHUNK_TIMEOUT,
+        )
 
     @asynccontextmanager
     async def _request(
@@ -453,6 +464,7 @@ class TeraboxClient:
             "Upload file chunk: %s to %s, size: %d, uploadid: %s",
             filename, remote_path, filesize, uploadid,
         )
+        current_upload_host = upload_host
         last_error: Exception | None = None
         for attempt in range(1, UPLOAD_CHUNK_MAX_ATTEMPTS + 1):
             try:
@@ -462,11 +474,11 @@ class TeraboxClient:
 
                     async with self._request(
                         'POST',
-                        f"https://{upload_host}/rest/2.0/pcs/superfile2?"
+                        f"https://{current_upload_host}/rest/2.0/pcs/superfile2?"
                         f"method=upload&type=tmpfile&app_id=250528&path={quote_plus(remote_path)}&"
                         f"uploadid={uploadid}&partseq={partseq}",
                         data=data,
-                        timeout=UPLOAD_CHUNK_TIMEOUT,
+                        timeout=self._chunk_request_timeout(),
                     ) as response:
                         content = await response.read()
                         LOGGER.debug("Upload chunk response: %s", content)
@@ -498,6 +510,24 @@ class TeraboxClient:
                     attempt,
                     UPLOAD_CHUNK_MAX_ATTEMPTS,
                 )
+                try:
+                    relocated_upload_host = await self._locate_upload_host()
+                except Exception as locate_err:
+                    LOGGER.warning(
+                        "Failed to relocate upload host for chunk %s after %s: %s",
+                        partseq,
+                        err.__class__.__name__,
+                        locate_err,
+                    )
+                else:
+                    if relocated_upload_host != current_upload_host:
+                        LOGGER.warning(
+                            "Relocated upload host for chunk %s: %s -> %s",
+                            partseq,
+                            current_upload_host,
+                            relocated_upload_host,
+                        )
+                    current_upload_host = relocated_upload_host
                 await asyncio.sleep(attempt)
 
         raise TeraboxApiError(
@@ -535,6 +565,37 @@ class TeraboxClient:
                     "The login session has expired. Please login again and refresh the credentials."
                 )
             raise TeraboxApiError(f"File precreate failed: {resp_data}")
+
+    async def _upload_chunks(
+        self,
+        *,
+        upload_host: str,
+        remote_path: str,
+        uploadid: str,
+        file_chunks_md5: list[tuple[str, int, str]],
+        concurrency: int = UPLOAD_CHUNK_CONCURRENCY,
+    ) -> list[dict]:
+        concurrency = max(1, concurrency)
+        semaphore = asyncio.Semaphore(concurrency)
+        chunk_results: list[dict | None] = [None] * len(file_chunks_md5)
+
+        async def upload_one(partseq: int, chunk_full_path: str, chunk_size: int, chunk_md5: str) -> None:
+            async with semaphore:
+                chunk_results[partseq] = await self._upload_file_chunk(
+                    upload_host=upload_host,
+                    filename=chunk_full_path,
+                    filesize=chunk_size,
+                    remote_path=remote_path,
+                    chunk_md5=chunk_md5,
+                    uploadid=uploadid,
+                    partseq=partseq,
+                )
+
+        await asyncio.gather(*(
+            upload_one(partseq, chunk_full_path, chunk_size, chunk_md5)
+            for partseq, (chunk_full_path, chunk_size, chunk_md5) in enumerate(file_chunks_md5)
+        ))
+        return [result for result in chunk_results if result is not None]
 
     async def _postcreate_file(self, remote_path: str, uploadid: str, file_size: int, md5_list_json: list[str]) -> dict:
         data = {
@@ -712,18 +773,12 @@ class TeraboxClient:
                 await self.refresh_cookies()
                 uploadid = await self._precreate_file(destination_path, only_md5_list)
             LOGGER.debug("Precreate uploadid = %s", uploadid)
-            chunk_results = []
-            for partseq, (chunk_full_path, chunk_size, chunk_md5) in enumerate(file_chunks_md5):
-                resp = await self._upload_file_chunk(
-                    upload_host=upload_host,
-                    filename=chunk_full_path,
-                    filesize=chunk_size,
-                    remote_path=destination_path,
-                    chunk_md5=chunk_md5,
-                    uploadid=uploadid,
-                    partseq=partseq,
-                )
-                chunk_results.append(resp)
+            chunk_results = await self._upload_chunks(
+                upload_host=upload_host,
+                remote_path=destination_path,
+                uploadid=uploadid,
+                file_chunks_md5=file_chunks_md5,
+            )
 
             final_resp = await self._postcreate_file(
                 remote_path=destination_path,
