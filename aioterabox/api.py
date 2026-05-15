@@ -28,7 +28,11 @@ LOGGER = logging.getLogger(__name__)
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.2; rv:121.0) Gecko/20100101 Firefox/121.0"
 BASE_TERABOX_URL = "https://www.terabox.com"
-INITIAL_URL = "https://www.terabox.app/wap/share/filelist?surl=12345678"
+INITIAL_URL = f"{BASE_TERABOX_URL}/wap/outlogin/login"
+FALLBACK_INITIAL_URLS = (
+    f"{BASE_TERABOX_URL}/wap/outlogin/emailRegister",
+    "https://www.terabox.app/wap/share/filelist?surl=12345678",
+)
 MAX_UNCHUNKED_FILE_SIZE = 10 * 1024 * 1024  # 10 mb
 CHUNK_SIZE = 4 * 1024 * 1024
 READ_BUF = 1 * 1024 * 1024  # 1 MB
@@ -230,40 +234,55 @@ class TeraboxClient:
         return self._signb, resp_data['data']['timestamp']
 
     async def _fetch_initial_data(self, url: str = INITIAL_URL, clean_cookies: bool = True) -> dict:
-        async with self._request(
-            'GET',
-            url,
-            clean_cookies=clean_cookies,
-            timeout=10,
-        ) as response:
-            text = await response.text()
-            tdata_rx = re.compile(r'<script>var templateData = (.*?);</script>')
-            js_token_rx = re.compile(r'window.jsToken%20%3D%20a%7D%3Bfn%28%22(.*?)%22%29')
+        bootstrap_urls = [url]
+        if url == INITIAL_URL:
+            bootstrap_urls.extend(FALLBACK_INITIAL_URLS)
 
-            # {'bdstoken': '', 'pcftoken': '98**20',
-            # 'newDomain': {'origin': 'https://www.terabox.com', 'host': 'www.terabox.com',
-            # 'domain': 'terabox.com', 'cdn': 'https://s3.teraboxcdn.com',
-            # 'isGCP': False, 'originalPrefix': 'www', 'regionDomainPrefix': 'www', 'urlDomainPrefix': 'www'},
-            # 'internal': False, 'country': '', 'userVipIdentity': 0, 'uk': 0}
-            tdata = json.loads(tdata_rx.search(text).group(1))
-            js_token_res = js_token_rx.search(text)
-            js_token = js_token_rx.search(text).group(1) if js_token_res else ''
+        last_error: Exception | None = None
+        for bootstrap_url in bootstrap_urls:
+            try:
+                async with self._request(
+                    'GET',
+                    bootstrap_url,
+                    clean_cookies=clean_cookies,
+                    timeout=10,
+                ) as response:
+                    text = await response.text()
+                    tdata_rx = re.compile(r'<script>var templateData = (.*?);</script>')
+                    js_token_rx = re.compile(r'window.jsToken%20%3D%20a%7D%3Bfn%28%22(.*?)%22%29')
 
-            # rotate auth cookies
-            csrf_token = tdata.get('csrf')
-            session_cookies = {
-                **self._session_from_cookie_jar(),
-                **({'csrfToken': csrf_token} if csrf_token else {}),
-                **({'jstoken': js_token} if js_token else {}),
-            }
-            self._update_session(session_cookies)
+                    # {'bdstoken': '', 'pcftoken': '98**20',
+                    # 'newDomain': {'origin': 'https://www.terabox.com', 'host': 'www.terabox.com',
+                    # 'domain': 'terabox.com', 'cdn': 'https://s3.teraboxcdn.com',
+                    # 'isGCP': False, 'originalPrefix': 'www', 'regionDomainPrefix': 'www', 'urlDomainPrefix': 'www'},
+                    # 'internal': False, 'country': '', 'userVipIdentity': 0, 'uk': 0}
+                    tdata = json.loads(tdata_rx.search(text).group(1))
+                    js_token_res = js_token_rx.search(text)
+                    js_token = js_token_rx.search(text).group(1) if js_token_res else ''
 
-            return {
-                'bdstoken': tdata.get('bdstoken', ''),
-                'pcftoken': tdata.get('pcftoken', ''),
-                'jstoken': js_token,
-                'cookies': session_cookies,
-            }
+                    # rotate auth cookies
+                    csrf_token = tdata.get('csrf')
+                    session_cookies = {
+                        **self._session_from_cookie_jar(),
+                        **({'csrfToken': csrf_token} if csrf_token else {}),
+                        **({'jstoken': js_token} if js_token else {}),
+                    }
+                    self._update_session(session_cookies)
+
+                    return {
+                        'bdstoken': tdata.get('bdstoken', ''),
+                        'pcftoken': tdata.get('pcftoken', ''),
+                        'jstoken': js_token,
+                        'cookies': session_cookies,
+                    }
+            except TimeoutError as exc:
+                last_error = exc
+                LOGGER.warning("Bootstrap URL timed out: %s", bootstrap_url)
+                continue
+
+        if last_error is not None:
+            raise last_error
+        raise TeraboxApiError("Failed to fetch bootstrap data.")
 
     async def refresh_cookies(self) -> dict:
         return await self._fetch_initial_data(f'{BASE_TERABOX_URL}/main', clean_cookies=False)
