@@ -31,6 +31,7 @@ pip install -e .
 import asyncio
 import aiohttp
 from aioterabox.api import TeraboxClient
+from aioterabox.exceptions import TeraboxLoginChallengeRequired
 
 
 async def main():
@@ -39,14 +40,12 @@ async def main():
             session=session,
             email='your_email',
             password='your_password',
-            cookies={
-                'csrfToken': '...',
-                'browserid': '...',
-                'ndus': '...',
-                'jstoken': '...',
-            },
         )
-        await tb.login()
+        try:
+            await tb.login()
+        except TeraboxLoginChallengeRequired as exc:
+            # TeraBox may require a simple-verify continuation step.
+            await tb.complete_login_challenge(exc.challenge)
 
         # get quota
         print('quota = ', await tb.get_storage_quota())
@@ -78,13 +77,21 @@ async def main():
 asyncio.run(main())
 ```
 
-Though the library supports authentication via username and password, it is highly recommended to use 
-session cookies for better reliability. You can obtain the required cookies by logging into TeraBox via 
-a web browser and inspecting the cookies set for the domain.
+The client can now start from only `email/password` and establish the session cookies on its own.
+When TeraBox responds with `need verify`, the library raises `TeraboxLoginChallengeRequired` and
+stores the in-progress session so the caller can continue the flow with `complete_login_challenge()`.
+
+If you want to persist a working session between restarts, store the cookies returned by `login()` or
+`complete_login_challenge()`. The useful fields are usually `jstoken`, `csrfToken`, `browserid`,
+`ndus`, `TSID`, `shareUpdateRandom`, and `lang`.
 
 For file operations you should always use absolute paths starting from the root directory `/`.
 
 ## Configuration
+
+### Manual cookie bootstrap
+If you prefer to start from an existing browser session, you can still extract the session JS Token
+and cookies manually.
 
 ### Getting the JS Token
 To use this tool you need to have a Terabox account and a JS Token key. You can get the session JS Token by logging into your Terabox account and following the sequence of steps below:

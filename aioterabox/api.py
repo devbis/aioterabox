@@ -4,7 +4,7 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
-from typing import Any, NamedTuple, TypedDict, get_type_hints
+from typing import Any, NamedTuple, TypedDict
 from urllib.parse import quote_plus
 
 import aiofiles
@@ -18,6 +18,8 @@ from .exceptions import (
     TeraboxApiError,
     TeraboxChecksumMismatchError,
     TeraboxContentTypeError,
+    TeraboxLoginChallenge,
+    TeraboxLoginChallengeRequired,
     TeraboxNotFoundError,
     TeraboxUnauthorizedError,
 )
@@ -30,13 +32,20 @@ INITIAL_URL = "https://www.terabox.app/wap/share/filelist?surl=12345678"
 MAX_UNCHUNKED_FILE_SIZE = 10 * 1024 * 1024  # 10 mb
 CHUNK_SIZE = 4 * 1024 * 1024
 READ_BUF = 1 * 1024 * 1024  # 1 MB
+REQUIRED_SESSION_KEYS = ("jstoken", "csrfToken", "browserid", "ndus")
+OPTIONAL_SESSION_KEYS = ("TSID", "shareUpdateRandom", "lang")
+SIMPLE_VERIFY_URL = f"{BASE_TERABOX_URL}/simple-verify"
+SIMPLE_VERIFY_MAX_ATTEMPTS = 8
 
 
-class TeraboxCookies(TypedDict):
+class TeraboxSession(TypedDict, total=False):
     jstoken: str  # not a cookie but we store it here for convenience
     csrfToken: str
     browserid: str
     ndus: str
+    TSID: str
+    shareUpdateRandom: str
+    lang: str
 
 
 class DownloadResponse(TypedDict):
@@ -71,7 +80,7 @@ class TeraboxClient:
         self.password = password
         self.lang = lang
 
-        self._cookies: TeraboxCookies = self.validate_cookies(cookies)
+        self._cookies: TeraboxSession = self.validate_cookies(cookies)
 
         self.session = session
         self._base_headers = {
@@ -90,26 +99,59 @@ class TeraboxClient:
     @property
     def request_cookies(self) -> dict[str, str]:
         """Get the cookies needed for requests."""
-        return {
-            **{k: v for k, v in self._cookies.items() if v},
-            **({'lang': self.lang} if 'lang' not in self._cookies else {}),
-        }
+        cookies = {k: v for k, v in self._cookies.items() if v}
+        cookies["lang"] = cookies.get("lang") or self.lang
+        return cookies
 
     @staticmethod
     def validate_cookies(cookies: dict[str, Any]):
-        required_cookie_keys = list(get_type_hints(TeraboxCookies).keys())
         if cookies is not None:
-            missing_keys = [key for key in required_cookie_keys if key not in cookies]
+            missing_keys = [key for key in REQUIRED_SESSION_KEYS if key not in cookies]
             if missing_keys:
                 raise ValueError(f"Missing required cookie keys: {', '.join(missing_keys)}")
 
-        return TeraboxCookies(**cookies) if cookies else TeraboxCookies(**{
-            k: '' for k in required_cookie_keys
-        })
+        defaults = {
+            **{key: '' for key in REQUIRED_SESSION_KEYS},
+            **{key: '' for key in OPTIONAL_SESSION_KEYS},
+        }
+        if cookies:
+            defaults.update(cookies)
+        return TeraboxSession(**defaults)
 
     @property
     def js_token(self) -> str:
         return self._cookies['jstoken']
+
+    def _update_session(self, *cookie_maps: dict[str, Any]) -> TeraboxSession:
+        for cookie_map in cookie_maps:
+            for key, value in cookie_map.items():
+                if value is None:
+                    continue
+                self._cookies[key] = str(value)
+        if not self._cookies.get("lang"):
+            self._cookies["lang"] = self.lang
+        return self._cookies
+
+    def _session_from_cookie_jar(self) -> dict[str, str]:
+        return {cookie.key: cookie.value for cookie in self.session.cookie_jar}
+
+    def build_login_challenge(
+        self,
+        *,
+        message: str,
+        challenge_type: str = "simple_verify",
+        url: str = SIMPLE_VERIFY_URL,
+        referrer: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> TeraboxLoginChallenge:
+        return TeraboxLoginChallenge(
+            challenge_type=challenge_type,
+            message=message,
+            url=url,
+            referrer=referrer or url,
+            session=dict(self.request_cookies),
+            metadata=metadata or {},
+        )
 
     @staticmethod
     async def file_md5(afile:AsyncBufferedReader, chunk_size=1024 * 1024) -> str:
@@ -209,19 +251,18 @@ class TeraboxClient:
 
             # rotate auth cookies
             csrf_token = tdata.get('csrf')
-            if js_token:
-                self._cookies['jstoken'] = js_token
-            if csrf_token:
-                self._cookies['csrfToken'] = csrf_token
+            session_cookies = {
+                **self._session_from_cookie_jar(),
+                **({'csrfToken': csrf_token} if csrf_token else {}),
+                **({'jstoken': js_token} if js_token else {}),
+            }
+            self._update_session(session_cookies)
 
             return {
                 'bdstoken': tdata.get('bdstoken', ''),
                 'pcftoken': tdata.get('pcftoken', ''),
                 'jstoken': js_token,
-                'cookies': {
-                    **{cookie.key: cookie.value for cookie in self.session.cookie_jar},
-                    **({'csrfToken': csrf_token} if csrf_token else {}),
-                }
+                'cookies': session_cookies,
             }
 
     async def refresh_cookies(self) -> dict:
@@ -762,11 +803,28 @@ class TeraboxClient:
                 raise TeraboxUnauthorizedError(f"Prelogin failed: {data['msg']}")
             return initial_vars, data['data']
 
-    async def do_email_login(self) -> dict:
-        initial_vars, prelogin = await self._prelogin(self.email)
+    async def _prime_simple_verify(self, referrer: str = SIMPLE_VERIFY_URL) -> dict:
+        async with self._request(
+            'GET',
+            referrer,
+            headers={"Referer": referrer},
+            clean_cookies=False,
+            timeout=10,
+        ) as response:
+            await response.text()
+        self._base_headers["Referer"] = referrer
+        session_cookies = self._session_from_cookie_jar()
+        self._update_session(session_cookies)
+        return session_cookies
 
-        encpass = change_base64_type(encrypt_rsa(self.password, await self.get_public_key(), 2), 2)
-        # print('cookies before', {cookie.key: cookie.value for cookie in session.cookie_jar})
+    async def _submit_email_login(
+        self,
+        *,
+        initial_vars: dict,
+        prelogin: dict,
+        encpass: str,
+        referer: str | None = None,
+    ) -> dict:
         prand = prand_gen(
             client='web',
             seval=prelogin['seval'],
@@ -776,10 +834,19 @@ class TeraboxClient:
             random=prelogin['random'],
         )
 
+        context = {
+            "initial_vars": initial_vars,
+            "prelogin": prelogin,
+            "encpass": encpass,
+        }
+
         async with self._request(
             'POST',
             f"{BASE_TERABOX_URL}/passport/login",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Referer": referer or self._base_headers["Referer"],
+            },
             clean_cookies=True,
             cookies=initial_vars['cookies'],
             data={
@@ -797,28 +864,19 @@ class TeraboxClient:
             timeout=10,
         ) as response:
             data = await response.json()
-            # print('initial data = ', initial_vars)
-            # print('cookies after', {cookie.key: cookie.value for cookie in session.cookie_jar})
-            # print('login data = ', data)
-
-            # {
-            #   'code': 0,
-            #   'data': {
-            #     'cur_country': 'US',
-            #     'displayName': 'USER12345678',
-            #     'headUrl': 'https://data.terabox.com/issue/netdisk/ts_ad/group/12345678.png',
-            #     'need_protect': 0,
-            #     'reg_country': 'US',
-            #     'reg_time': 1234567890,
-            #     'region_domain_prefix': 'www',
-            #     'url_domain_prefix': 'www'
-            #   },
-            #   'logid': 1234567890,
-            #   'msg': ''
-            # }
             if data['code'] != 0:
+                if data.get("errmsg") == "need verify":
+                    raise TeraboxLoginChallengeRequired(
+                        self.build_login_challenge(
+                            message="Login requires simple-verify continuation.",
+                            metadata={
+                                "response": data,
+                                "login_context": context,
+                            },
+                        )
+                    )
                 raise TeraboxUnauthorizedError(f"Login failed: {data['errmsg']}")
-            self._cookies.update({cookie.key: cookie.value for cookie in self.session.cookie_jar})
+            self._update_session(self._session_from_cookie_jar())
             self.account.update({
                 'display_name': data['data']['displayName'],
                 'head_url': data['data']['headUrl'],
@@ -832,9 +890,45 @@ class TeraboxClient:
             ) as logged_response:
                 resp = await logged_response.text()
                 js_token_rx = re.compile(r'templateData.*?window.jsToken%20%3D%20a%7D%3Bfn%28%22(.*?)%22%29')
-                self._cookies['jstoken'] = js_token_rx.search(resp).group(1)
+                jstoken_match = js_token_rx.search(resp)
+                if jstoken_match:
+                    self._update_session({"jstoken": jstoken_match.group(1)})
+            self._update_session(self._session_from_cookie_jar())
 
             return data
+
+    async def do_email_login(self, *, referer: str | None = None) -> dict:
+        initial_vars, prelogin = await self._prelogin(self.email)
+
+        encpass = change_base64_type(encrypt_rsa(self.password, await self.get_public_key(), 2), 2)
+        return await self._submit_email_login(
+            initial_vars=initial_vars,
+            prelogin=prelogin,
+            encpass=encpass,
+            referer=referer,
+        )
+
+    async def complete_login_challenge(self, challenge: TeraboxLoginChallenge) -> dict[str, str]:
+        self._update_session(challenge.session)
+        current_challenge = challenge
+        for _ in range(SIMPLE_VERIFY_MAX_ATTEMPTS):
+            await self._prime_simple_verify(current_challenge.url)
+            try:
+                context = current_challenge.metadata.get("login_context")
+                if context:
+                    await self._submit_email_login(
+                        initial_vars=context["initial_vars"],
+                        prelogin=context["prelogin"],
+                        encpass=context["encpass"],
+                        referer=current_challenge.referrer,
+                    )
+                else:
+                    await self.do_email_login(referer=current_challenge.referrer)
+            except TeraboxLoginChallengeRequired as exc:
+                current_challenge = exc.challenge
+                continue
+            return self.request_cookies
+        raise TeraboxLoginChallengeRequired(current_challenge)
 
     async def ensure_logged_in(self) -> AccountInfo:
         async with self._request('GET', f"{BASE_TERABOX_URL}/passport/get_info", timeout=10) as response:
@@ -853,6 +947,7 @@ class TeraboxClient:
             if data.get("code") != 0:
                 raise TeraboxUnauthorizedError(f"Login failed: {data['msg']}")
             self.account.update(data['data'])
+        await self.get_account_id()
         # rotate cookies on every login
         await self.refresh_cookies()
         return self.account
@@ -871,5 +966,21 @@ class TeraboxClient:
                 pass
             else:
                 return None
-        await self.do_email_login()
+        try:
+            await self.do_email_login()
+        except TeraboxLoginChallengeRequired as exc:
+            try:
+                return await self.complete_login_challenge(exc.challenge)
+            except TeraboxLoginChallengeRequired:
+                raise
+        except TeraboxUnauthorizedError as exc:
+            if "need verify" in str(exc):
+                challenge = self.build_login_challenge(
+                    message="Login requires simple-verify continuation.",
+                )
+                try:
+                    return await self.complete_login_challenge(challenge)
+                except TeraboxLoginChallengeRequired:
+                    raise TeraboxLoginChallengeRequired(challenge) from exc
+            raise
         return self._cookies
